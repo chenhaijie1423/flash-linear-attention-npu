@@ -86,12 +86,12 @@ public:
         }
 
         CATLASS_DEVICE
-        Params(GM_ADDR ptrA_, LayoutA layoutA_, GM_ADDR ptrVb_, LayoutVb layoutVb_, GM_ADDR ptrW_,
-               LayoutW layoutW_, GM_ADDR ptrKbgExp_, LayoutKbgExp layoutKbgExp_, GM_ADDR ptrU_, LayoutU layoutU_,
+        Params(GM_ADDR ptrA_, LayoutA layoutA_, GM_ADDR ptrVb_, LayoutVb layoutVb_, GM_ADDR ptrU_,
+               LayoutW layoutW_, GM_ADDR ptrKbgExp_, LayoutKbgExp layoutKbgExp_, GM_ADDR ptrW_, LayoutU layoutU_,
                GM_ADDR ptrCuSeqLens_, GM_ADDR ptrChunkIndices_, uint64_t chunkNum_, uint64_t B_,
                uint64_t T_, uint64_t H_, uint64_t K_, uint64_t V_, uint64_t BT_)
-            : ptrA(ptrA_), layoutA(layoutA_), ptrVb(ptrVb_), layoutVb(layoutVb_), ptrW(ptrW_),
-              layoutW(layoutW_), ptrKbgExp(ptrKbgExp_), layoutKbgExp(layoutKbgExp_), ptrU(ptrU_), layoutU(layoutU_),
+            : ptrA(ptrA_), layoutA(layoutA_), ptrVb(ptrVb_), layoutVb(layoutVb_), ptrU(ptrU_),
+              layoutW(layoutW_), ptrKbgExp(ptrKbgExp_), layoutKbgExp(layoutKbgExp_), ptrW(ptrW_), layoutU(layoutU_),
               ptrCuSeqLens(ptrCuSeqLens_), ptrChunkIndices(ptrChunkIndices_),
               chunkNum(chunkNum_), B(B_), T(T_), H(H_), K(K_), V(V_), chunkSize(BT_)
         {

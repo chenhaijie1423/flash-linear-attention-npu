@@ -5,7 +5,7 @@ import pickle
 import math
 import ct
 import random
-torch.npu.utils.set_device(4)
+torch.npu.utils.set_device(6)
 
 def get_bos_eos(idx, T, chunk_size, cu_seqlens, chunk_indices):
     if cu_seqlens != None:
@@ -24,9 +24,11 @@ def get_bos_eos(idx, T, chunk_size, cu_seqlens, chunk_indices):
     return bos,eos
 
 def compute_w_golden(
-    A: torch.Tensor,      # [B, T, H, chunk_size] - 每个chunk的A值
-    du: torch.Tensor,     # [B, T, H, D] - 上游梯度
-    beta: torch.Tensor,   # [B, H, T] - beta参数
+    k: torch.Tensor,     # [B, T, H, D]
+    v: torch.Tensor,     # [B, T, H, D]
+    beta: torch.Tensor,   # [B, H, T]
+    A: torch.Tensor,      # [B, T, H, chunk_size]
+    g: torch.Tensor,      # [B, T, H]
     cu_seqlens: torch.Tensor,
     chunk_indices: torch.Tensor,
     B: int,
@@ -45,47 +47,47 @@ def compute_w_golden(
     3. 计算该chunk内的dv: dv_chunk = A_chunk @ du_chunk * beta_chunk
     """
     # 初始化dv，形状与du相同 [B, T, H, D]
-    dv = torch.zeros_like(du)
+    w = torch.zeros_like(k)
     for i_b in range(B):
         for idx in range(NT):
             bos,eos = get_bos_eos(idx, T, chunk_size, cu_seqlens, chunk_indices)
             # print(bos, eos, eos-bos)
         # 遍历所有batch
             for i_h in range(H):
-                
+                # print("hello?")
             # 遍历所有head 
                 # 获取当前chunk的A向量
                 # A形状: [B, T, H, chunk_size]
                 # 我们需要获取这个chunk对应的A向量
                 # 注意: A的每个位置存储的是该chunk对应的A向量
-                A_chunk = A[i_b,i_h, bos:eos,:eos - bos]  # [chunk_size, chunk_size]
-                
-                # 获取当前chunk的du
-                du_chunk = du[i_b,i_h, bos:eos, :]  # [chunk_size, V]
+                A_chunk = A[i_b,i_h, bos:eos,:eos - bos]
+                k_chunk = k[i_b,i_h, bos:eos,:]
                 
                 # 获取当前chunk的beta
                 beta_chunk = beta[i_b,i_h, bos:eos]  # [chunk_size]
-                
+                g_chunk = g[i_b,i_h, bos:eos]  # [chunk_size]
+                g_exp_chunk = torch.exp(g_chunk.to(torch.float32))
+                beta_g_exp_chunk = beta_chunk.to(torch.float32) * g_exp_chunk.to(torch.float32)
+                kbgexp_chunk = k_chunk * beta_g_exp_chunk[:,None]
+
                 # 计算 dv_chunk = A_chunk @ du_chunk * beta_chunk
                 # 步骤1: b_dv_beta = A_chunk @ du_chunk
-                b_dv_beta = torch.matmul(A_chunk.T.to(torch.float32), du_chunk.to(torch.float32))  # [chunk_size, V]
+                # print(A_chunk.size())
+                b_w = torch.matmul(A_chunk.to(torch.float32), kbgexp_chunk.to(torch.float32))  # [chunk_size, V]
                 
-                # 步骤2: dv_chunk = b_dv_beta * beta_chunk.unsqueeze(-1)
-                dv_chunk = b_dv_beta.to(torch.float32) * beta_chunk[:, None].to(torch.float32)  # [chunk_size, D]
-                
+
                 # 存储结果
-                dv[i_b,i_h, bos:eos, :] = dv_chunk.to(dv.dtype)
+                w[i_b,i_h, bos:eos, :] = b_w.to(w.dtype)
     
-    return dv
+    return w
 
 
 def compute_u_golden(
-    A: torch.Tensor,      # [B, T, H, chunk_size] - 每个chunk的A值
-    dw: torch.Tensor,     # [B, T, H, D]
-    g: torch.Tensor,     # [B, H, T]
-    beta: torch.Tensor,   # [B, H, T] - beta参数
-    dA: torch.Tensor,      # [B, T, H, chunk_size]
     k: torch.Tensor,     # [B, T, H, D]
+    v: torch.Tensor,     # [B, T, H, D]
+    beta: torch.Tensor,   # [B, H, T]
+    A: torch.Tensor,      # [B, T, H, chunk_size]
+    g: torch.Tensor,      # [B, T, H]
     cu_seqlens: torch.Tensor,
     chunk_indices: torch.Tensor,
     B: int,
@@ -103,7 +105,7 @@ def compute_u_golden(
     2. 获取对应的seq_idx, chunk_indices
     3. 计算该chunk内的dv: dv_chunk = A_chunk @ du_chunk * beta_chunk
     """
-    dk = torch.zeros_like(k)
+    u = torch.zeros_like(v)
     for i_b in range(B):
         for idx in range(NT):
             bos,eos = get_bos_eos(idx, T, chunk_size, cu_seqlens, chunk_indices)
@@ -114,33 +116,20 @@ def compute_u_golden(
                 # A形状: [B, T, H, chunk_size]
                 # 我们需要获取这个chunk对应的A向量
                 # 注意: A的每个位置存储的是该chunk对应的A向量
+                u_chunk = u[i_b,i_h, bos:eos,:]
                 A_chunk = A[i_b,i_h, bos:eos,: eos - bos]  # [chunk_size, chunk_size]
                 
                 # 获取当前chunk的dw
-                dw_chunk = dw[i_b,i_h, bos:eos, :]  # [chunk_size, D]
+                v_chunk = v[i_b,i_h, bos:eos, :]  # [chunk_size, D]
            
                 # 获取当前chunk的beta,g
                 beta_chunk = beta[i_b,i_h, bos:eos]  # [chunk_size]
-                g_chunk = g[i_b,i_h, bos:eos]  # [chunk_size]
-                g_exp_chunk = torch.exp(g_chunk.to(torch.float32))
-                #   k________0
-                k_chunk = k[i_b, i_h, bos:eos, : ]
-                dA_chunk = dA[i_b,i_h, bos:eos,:eos-bos]  # [chunk_size, chunk_size]
-                b_dk_beta = torch.matmul(dA_chunk.T.to(torch.float32), k_chunk.to(torch.float32))  # [chunk_size, D]
-                #   k________1
-                b_kt_beta = k_chunk.T.to(torch.float32) * beta_chunk.to(torch.float32)[None,: ]
-                b_k_beta = k_chunk.to(torch.float32) * beta_chunk.to(torch.float32)[:, None]
-                #   k________2
-                # 步骤1: b_dk_beta_g = A_chunk @ dw_chunk
-                b_dk_beta_g = torch.matmul(A_chunk.T.to(torch.float32), dw_chunk.to(torch.float32))  # [chunk_size, D]
-                
-                # 步骤2: dk_chunk = b_dk_beta_g * beta_chunk[:, None] * g_exp_chunk[:, None] 
-                dk_chunk = torch.matmul(dA_chunk.to(torch.float32), b_k_beta.to(k.dtype).to(torch.float32)).to(k.dtype).to(torch.float32)  # [chunk_size, D]
-                dk_chunk = dk_chunk.to(k.dtype).to(torch.float32) + (b_dk_beta.to(k.dtype).to(torch.float32) * beta_chunk[:, None].to(torch.float32))
-                dk_chunk = dk_chunk.to(k.dtype).to(torch.float32) + b_dk_beta_g.to(k.dtype).to(torch.float32) * (beta_chunk.to(torch.float32) * g_exp_chunk.to(torch.float32))[:,None]  # [chunk_size, D]
+                vb_chunk = v_chunk.to(torch.float32) * beta_chunk[:,None].to(torch.float32)
+                u_chunk = torch.matmul(A_chunk.to(torch.float32), vb_chunk.to(torch.float32))  # [chunk_size, V]
+
                 # 存储结果
-                dk[i_b,i_h, bos:eos, :] = dk_chunk
-    return dk
+                u[i_b,i_h, bos:eos, :] = u_chunk.to(u.dtype)
+    return u
 
 
 def prepare_lens(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
@@ -264,7 +253,7 @@ def test_recompute_wu_fwd(
     返回:
         tuple: (dw, du) —— 反向传播的梯度结果（在 NPU 上）
     """
-    torch.manual_seed(seed)
+    torch.manual_seed(42)
     if not hasattr(test_recompute_wu_fwd, "call_count"):
         test_recompute_wu_fwd.call_count = 1
     else:
@@ -277,9 +266,14 @@ def test_recompute_wu_fwd(
     A = torch.rand(B, H, T, chunk_size, dtype=ktype)
     g = torch.rand(B, H, T, dtype=btype)
 
+    if chunk_indices!=None:
+        NT = len(chunk_indices) // 2
+    else:
+        NT = (T + chunk_size - 1) // chunk_size
+
     # 将张量移到 NPU 并调用反向算子
     if chunk_indices != None:
-        dw, du = torch_npu.npu_recompute_w_u_fwd(
+        w, u = torch_npu.npu_recompute_w_u_fwd(
             k.npu(),
             v.npu(),
             beta.npu(),
@@ -291,7 +285,7 @@ def test_recompute_wu_fwd(
             chunk_size=chunk_size
         )
     else:
-        dw, du = torch_npu.npu_recompute_w_u_fwd(
+        w, u = torch_npu.npu_recompute_w_u_fwd(
             k.npu(),
             v.npu(),
             beta.npu(),
@@ -302,17 +296,13 @@ def test_recompute_wu_fwd(
             chunk_indices=None,
             chunk_size=chunk_size
         )
-    if chunk_indices!=None:
-        NT = len(chunk_indices) // 2
-    else:
-        NT = (T + chunk_size - 1) // chunk_size
-    # cpu_dv = compute_dv_golden(A, du, beta, cu_seqlens, chunk_indices, B, H, T, K, chunk_size, NT)
-    # ct.isclose(dv, cpu_dv, diff_thd=0.1)
-    # # torch.save(cpu_dv, "cpu_dv.pt")
+    # cpu_w = compute_w_golden(k, v, beta, A, g, cu_seqlens, chunk_indices, B, H, T, K, chunk_size, NT)
+    # ct.isclose(w.cpu(), cpu_w.cpu(), diff_thd=0.1)
+    # torch.save(cpu_dv, "cpu_dv.pt")
     
-    # cpu_dk = compute_dk_golden(A, dw, g, beta, dA,k, cu_seqlens, chunk_indices, B, H, T, K, chunk_size, NT)
-    # ct.isclose(dk, cpu_dk, diff_thd=0.1)
-    # # torch.save(cpu_dk, "cpu_dk.pt")
+    cpu_u = compute_u_golden(k, v, beta, A, g, cu_seqlens, chunk_indices, B, H, T, K, chunk_size, NT)
+    ct.isclose(u.cpu(), cpu_u.cpu(), diff_thd=0.1)
+    # torch.save(cpu_dk, "cpu_dk.pt")
 
     
     print(f"test_recompute_wu_fwd 被调用了第 {test_recompute_wu_fwd.call_count} 次")

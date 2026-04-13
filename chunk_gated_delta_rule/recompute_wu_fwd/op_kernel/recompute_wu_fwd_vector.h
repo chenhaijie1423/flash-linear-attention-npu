@@ -138,7 +138,7 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType>::ProcessVb()
     // // init
     pipe->InitBuffer(vInQue, 2, rowNum * V * sizeof(kType));
     pipe->InitBuffer(betaInQue, 2, rowNum * sizeof(betaType));
-    pipe->InitBuffer(vbOutQue, 2, rowNum * sizeof(kType));
+    pipe->InitBuffer(vbOutQue, 2, rowNum * V * sizeof(kType));
     pipe->InitBuffer(vFp32Buf, rowNum * V * sizeof(float32_t));
     pipe->InitBuffer(betaFp32Buf, rowNum * sizeof(float32_t));
     pipe->InitBuffer(betaFp32BrcbBuf, rowNum * ONE_BLOCK_32);
@@ -166,7 +166,7 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType>::ProcessVb()
                     auto tensorVin = vInQue.AllocTensor<kType>();
                     auto tensorBetain = betaInQue.AllocTensor<betaType>();
 
-                    DataCopy(tensorVin, kTensor[vOffset], K * curRowNum);
+                    DataCopy(tensorVin, vTensor[vOffset], V * curRowNum);
                     DataCopyPad(tensorBetain, betaTensor[betaOffset], {1, curRowNum * static_cast<uint32_t>(sizeof(betaType)), 0, 0, 0},{false, 0, 0, 0});
 
                     vInQue.EnQue(tensorVin);

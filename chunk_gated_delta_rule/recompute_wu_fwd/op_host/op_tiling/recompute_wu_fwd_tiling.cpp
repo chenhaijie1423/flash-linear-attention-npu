@@ -23,8 +23,8 @@ static constexpr size_t INPUT_V_IDX = 1;
 static constexpr size_t INPUT_BETA_IDX = 2;
 static constexpr size_t INPUT_A_IDX = 3;
 static constexpr size_t INPUT_G_IDX = 4;
-static constexpr size_t INPUT_SEQLENS_IDX = 5;
-static constexpr size_t INPUT_CHUNK_INDICES_IDX = 6;
+static constexpr size_t INPUT_SEQLENS_IDX = 6;
+static constexpr size_t INPUT_CHUNK_INDICES_IDX = 7;
 
 static constexpr size_t ATTR_CHUNK_SIZE_IDX = 0;
 
