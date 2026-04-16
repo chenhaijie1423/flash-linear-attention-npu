@@ -182,10 +182,12 @@ ge::graphStatus RecurrentGatedDeltaRuleTiling::AnalyzeDtype()
 
     auto betaDtype = context_->GetInputDesc(BETA_INDEX)->GetDataType();
     auto stateDtype = context_->GetInputDesc(STATE_INDEX)->GetDataType();
-    OP_CHECK_IF(betaDtype != ge::DT_BF16 || stateDtype != ge::DT_BF16,
-                OP_LOGE(context_->GetNodeName(), "beta dtype and state dtype should be bfloat16"),
+    OP_CHECK_IF(betaDtype != ge::DT_BF16 ,
+                OP_LOGE(context_->GetNodeName(), "beta dtype should be bfloat16"),
                 return ge::GRAPH_FAILED);
-
+    OP_CHECK_IF(stateDtype != ge::DT_FLOAT && stateDtype != ge::DT_BF16,
+                OP_LOGE(context_->GetNodeName(), "state dtype should be bfloat16 or float32"),
+                return ge::GRAPH_FAILED);
     auto cuSeqlensDtype = context_->GetInputDesc(CUSEQLENS_INDEX)->GetDataType();
     auto ssmStateIndicesDtype = context_->GetInputDesc(SSM_STATE_INDICES_INDEX)->GetDataType();
     OP_CHECK_IF(cuSeqlensDtype != ge::DT_INT32 || ssmStateIndicesDtype != ge::DT_INT32,
@@ -280,7 +282,7 @@ void RecurrentGatedDeltaRuleTiling::FillTilingShapeData(const gert::Shape &query
     tilingData_.nv = valueShape.GetDim(DIM_1);
     tilingData_.dv = valueShape.GetDim(DIM_2);
     tilingData_.sBlockNum = stateShape.GetDim(DIM_0);
-    tilingData_.b = cuSeqlensShape.GetDim(DIM_0);
+    tilingData_.b = cuSeqlensShape.GetDim(DIM_0) - 1;
 }
 
 ge::graphStatus RecurrentGatedDeltaRuleTiling::CheckShapeValueRangeAndRule()
@@ -517,7 +519,9 @@ int64_t RecurrentGatedDeltaRuleTiling::CalcWorkingUbBytes(int64_t aNv, int64_t a
 int64_t RecurrentGatedDeltaRuleTiling::CalcVStepCoeff(int64_t aDk, uint32_t stateOutBufferNum,
                                                        uint32_t attnOutBufferNum) const
 {
-    int64_t coeff = (2 + static_cast<int64_t>(2 * stateOutBufferNum)) * aDk +
+    auto stateDtype = context_->GetInputDesc(STATE_INDEX)->GetDataType();
+    int64_t stateDtypeSize = (stateDtype == ge::DT_FLOAT) ? 4 : 2;
+    int64_t coeff = (stateDtypeSize + static_cast<int64_t>(stateDtypeSize * stateOutBufferNum)) * aDk +
                     static_cast<int64_t>(4 * attnOutBufferNum); // stateIn/stateOut/attnOut queues
     coeff += (4 + 4) * aDk + 4 + 4;                             // qInUb/kInUb/vInUb/deltaInUb/attnInUb
     return coeff;
@@ -582,12 +586,19 @@ ge::graphStatus RecurrentGatedDeltaRuleTiling::FinalizeVStepFromUb(int64_t ubSiz
             selected = profile;
         }
     }
+    
+    OP_LOGD(context_->GetNodeName(), "selected profile: stateOutBufferNum=[%u], attnOutBufferNum=[%u], vStep=[%u], repeatTime=[%u], valid=[%d]",
+            selected.stateOutBufferNum, selected.attnOutBufferNum, selected.vStep, selected.repeatTime, selected.valid);
+
     if (!selected.valid) {
         OP_LOGE(context_->GetNodeName(), "vStep should be bigger than 8, shape is too big");
         return ge::GRAPH_FAILED;
     }
+    auto stateDtype = context_->GetInputDesc(STATE_INDEX)->GetDataType();
 
-    int64_t queueCoeff = (2 + static_cast<int64_t>(2 * selected.stateOutBufferNum)) * aDk +
+    int64_t stateDtypeSize = (stateDtype == ge::DT_FLOAT) ? 4 : 2;
+
+    int64_t queueCoeff = (stateDtypeSize + static_cast<int64_t>(stateDtypeSize * selected.stateOutBufferNum)) * aDk +
                          static_cast<int64_t>(4 * selected.attnOutBufferNum);
     int64_t ubRestBytes = ubSize - ubCalcCtx_.fixedUbBytes - queueCoeff * static_cast<int64_t>(selected.vStep);
     if (ubRestBytes < 0) {
