@@ -17,7 +17,7 @@ template <
     class MaskInputType_
 >
 class BlockEpilogue <
-    EpilogueAtlasA2GDNFwdOQkmask,
+    EpilogueAtlasGDNFwdOQkmask,
     AOutputType_,
     GInputType_,
     AInputType_,
@@ -25,7 +25,7 @@ class BlockEpilogue <
 > {
 public:
     // Type aliases
-    using DispatchPolicy = EpilogueAtlasA2GDNFwdOQkmask;
+    using DispatchPolicy = EpilogueAtlasGDNFwdOQkmask;
     using ArchTag = typename DispatchPolicy::ArchTag;
 
     using AElementOutput = typename AOutputType_::Element;

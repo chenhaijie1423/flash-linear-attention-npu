@@ -18,7 +18,7 @@ template <
     class WSInputType_
 >
 class BlockEpilogue <
-    EpilogueAtlasA2GDNFwdHVnew,
+    EpilogueAtlasGDNFwdHVnew,
     VOutputType_,
     GInputType_,
     UInputType_,
@@ -26,7 +26,7 @@ class BlockEpilogue <
 > {
 public:
     // Type aliases
-    using DispatchPolicy = EpilogueAtlasA2GDNFwdHVnew;
+    using DispatchPolicy = EpilogueAtlasGDNFwdHVnew;
     using ArchTag = typename DispatchPolicy::ArchTag;
 
     using VElementOutput = typename VOutputType_::Element;

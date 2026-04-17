@@ -1,11 +1,5 @@
-/**
- * Copyright (c) 2025 Tianjin University, Ltd.
- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
- * the BSD 3-Clause License (the "License").
- * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
- */
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
+#define CATLASS_ARCH 3510
 
 #include "catlass/arch/arch.hpp"
 #include "catlass/arch/cross_core_sync.hpp"
@@ -25,8 +19,50 @@
 #include "tla/layout.hpp"
 #include "tla/tensor.hpp"
 
+using _0 = tla::Int<0>;
+using _1 = tla::Int<1>;
+using _2 = tla::Int<2>;
+using _4 = tla::Int<4>;
+using _8 = tla::Int<8>;
+using _16 = tla::Int<16>;
+using _32 = tla::Int<32>;
+using _64 = tla::Int<64>;
+using _128 = tla::Int<128>;
+using _256 = tla::Int<256>;
+using _512 = tla::Int<512>;
+using _1024 = tla::Int<1024>;
+using _2048 = tla::Int<2048>;
+using _4096 = tla::Int<4096>;
+using _8192 = tla::Int<8192>;
+using _16384 = tla::Int<16384>;
+using _32768 = tla::Int<32768>;
+using _65536 = tla::Int<65536>;
+
+#else
+#define CATLASS_ARCH 2201
+
+#include "catlass/arch/arch.hpp"
+#include "catlass/arch/cross_core_sync.hpp"
+#include "catlass/arch/resource.hpp"
+#include "catlass/catlass.hpp"
+#include "catlass/debug.hpp"
+#include "catlass/epilogue/block/block_epilogue.hpp"
+#include "catlass/epilogue/dispatch_policy.hpp"
+#include "catlass/gemm/block/block_mmad.hpp"
+#include "catlass/gemm/block/block_swizzle.hpp"
+#include "catlass/gemm/block/block_scheduler_gdn_fwd_o.hpp"
+#include "catlass/gemm/dispatch_policy.hpp"
+#include "catlass/gemm/gemm_type.hpp"
+#include "catlass/layout/layout.hpp"
+#include "catlass/gemm_coord.hpp"
+#include "tla/tensor.hpp"
+#include "tla/layout.hpp"
+#include "tla/tensor.hpp"
+#endif
+
 #include "kernel_operator.h"
 using namespace Catlass;
+using namespace tla;
 
 // template <>
 namespace Catlass::Gemm::Kernel {
@@ -39,13 +75,17 @@ template<
 class GDNFwdOKernel {
 public:
     
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
+    using ArchTag = Arch::Ascend950;
+#else
     using ArchTag = Arch::AtlasA2;
+#endif
     using GDNFwdOOffsets = Catlass::Gemm::Block::GDNFwdOOffsets;
 
     using CubeScheduler = typename Catlass::Gemm::Block::BlockSchedulerGdnFwdOCube;
     using VecScheduler = typename Catlass::Gemm::Block::BlockSchedulerGdnFwdOVec;
 
-    using DispatchPolicyTla = Gemm::MmadPingpongTlaMulti<ArchTag, true>;
+    using DispatchPolicyTla = Gemm::MmadPingpongTlaMulti<ArchTag, true, false>;
     using L1TileShapeTla = Shape<_128, _128, _128>;
     using L0TileShapeTla = L1TileShapeTla;
     using QType = Gemm::GemmType<INPUT_TYPE, layout::RowMajor>;
@@ -73,11 +113,11 @@ public:
     using BlockMmadAttenVNEW = Gemm::Block::BlockMmadTla<DispatchPolicyTla, L1TileShapeTla, L0TileShapeTla, INPUT_TYPE, INPUT_TYPE, WORKSPACE_TYPE, void, TileCopyAttenVNEW>;
 
     // vec 1
-    using DispatchPolicyGDNFwdOQkmask = Epilogue::EpilogueAtlasA2GDNFwdOQkmask;
+    using DispatchPolicyGDNFwdOQkmask = Epilogue::EpilogueAtlasGDNFwdOQkmask;
     using EpilogueGDNFwdOQkmask = Epilogue::Block::BlockEpilogue<DispatchPolicyGDNFwdOQkmask, AttenMaskedType, GType, AttenType, MaskType>;
 
     // vec 2
-    using DispatchPolicyGDNFwdOOutput = Epilogue::EpilogueAtlasA2GDNFwdOOutput;
+    using DispatchPolicyGDNFwdOOutput = Epilogue::EpilogueAtlasGDNFwdOOutput;
     using EpilogueGDNFwdOOutput = Epilogue::Block::BlockEpilogue<DispatchPolicyGDNFwdOOutput, OType, GType, OinterType, OinterType>;
 
     using ElementQ = typename BlockMmadQK::ElementA;

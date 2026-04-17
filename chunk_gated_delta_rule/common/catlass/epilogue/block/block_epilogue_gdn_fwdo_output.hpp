@@ -18,7 +18,7 @@ template <
     class HInputType_
 >
 class BlockEpilogue <
-    EpilogueAtlasA2GDNFwdOOutput,
+    EpilogueAtlasGDNFwdOOutput,
     HOutputType_,
     GInputType_,
     AInputType_,
@@ -26,7 +26,7 @@ class BlockEpilogue <
 > {
 public:
     // Type aliases
-    using DispatchPolicy = EpilogueAtlasA2GDNFwdOOutput;
+    using DispatchPolicy = EpilogueAtlasGDNFwdOOutput;
     using ArchTag = typename DispatchPolicy::ArchTag;
 
     using HElementOutput = typename HOutputType_::Element;

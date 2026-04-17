@@ -17,7 +17,7 @@ template <
     class FinalStateType_
 >
 class BlockEpilogue <
-    EpilogueAtlasA2GDNFwdHUpdate,
+    EpilogueAtlasGDNFwdHUpdate,
     HOutputType_,
     GInputType_,
     HInputType_,
@@ -26,7 +26,7 @@ class BlockEpilogue <
 > {
 public:
     // Type aliases
-    using DispatchPolicy = EpilogueAtlasA2GDNFwdHUpdate;
+    using DispatchPolicy = EpilogueAtlasGDNFwdHUpdate;
     using ArchTag = typename DispatchPolicy::ArchTag;
 
     using HElementOutput = typename HOutputType_::Element;
