@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import math
 import shutil
 from typing import Optional
+import aclnn_extension
 np.random.seed(1)
 torch.manual_seed(1)
 
@@ -310,23 +311,35 @@ if __name__ == "__main__":
     else:
         input_tensor = gen_input_data(gdn_fwd_h_input)
 
-    if gdn_fwd_h_input.use_actual_output:
-        output_tensor = parse_actual_output(gdn_fwd_h_input)
-    else:
-        output_tensor = gen_ref_data(gdn_fwd_h_input, input_tensor)
     torch.npu.synchronize()
-    result = torch_npu.npu_chunk_gated_delta_rule_fwd_h(
+    result = torch.ops.npu.npu_chunk_gated_delta_rule_fwd_h(
         input_tensor.k.npu(),
         input_tensor.w.npu(),
         input_tensor.u.npu(),
         input_tensor.g.npu(),
-        input_tensor.initial_state.npu() if input_tensor.initial_state is not None else None,
-        input_tensor.cu_seqlens.npu() if input_tensor.cu_seqlens is not None else None,
-        input_tensor.chunk_offsets.npu() if input_tensor.chunk_offsets is not None else None,
-        gdn_fwd_h_input.store_final_state,
-        gdn_fwd_h_input.chunk_size
+        initial_state=(
+            input_tensor.initial_state.npu()
+            if input_tensor.initial_state is not None
+            else None
+        ),
+        cu_seqlens=(
+            input_tensor.cu_seqlens.tolist()
+            if input_tensor.cu_seqlens is not None
+            else None
+        ),
+        chunk_indices=(
+            input_tensor.chunk_offsets.tolist()
+            if input_tensor.chunk_offsets is not None
+            else None
+        ),
+        output_final_state=gdn_fwd_h_input.store_final_state,
+        chunk_size=gdn_fwd_h_input.chunk_size,
     )
     torch.npu.synchronize()
+    if gdn_fwd_h_input.use_actual_output:
+        output_tensor = parse_actual_output(gdn_fwd_h_input)
+    else:
+        output_tensor = gen_ref_data(gdn_fwd_h_input, input_tensor)
     save_data(input_tensor, output_tensor)
     result[0].cpu().view(torch.int16).numpy().tofile(os.path.join(WORKSPACE, "data", "h_npu.bin"))
     result[1].cpu().view(torch.int16).numpy().tofile(os.path.join(WORKSPACE, "data", "v_npu.bin"))

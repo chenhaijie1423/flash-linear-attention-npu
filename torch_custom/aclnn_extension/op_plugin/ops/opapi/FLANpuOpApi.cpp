@@ -201,7 +201,7 @@ at::Tensor npu_chunk_fwd_o(
     int64_t B = k_sizes[0];
     int64_t T = k_sizes[2];
     int64_t K = k_sizes[3];
-    int64_t V = k_sizes[3];
+    int64_t V = u_sizes[3];
     int64_t HV = u_sizes[1];
     int64_t NT = 0;
     if (chunk_indices.has_value()) {
@@ -216,12 +216,9 @@ at::Tensor npu_chunk_fwd_o(
     at::Tensor v_new_out = at::empty_like(u);
     at::Tensor final_state_out;
     if (output_final_state_) {
-        auto initial_state_sizes = initial_state_.sizes();
-        int64_t BT = initial_state_sizes[2];
-
-        final_state_out = at::empty({B, HV, BT, K, V}, initial_state_.options());
-    } else {
-        final_state_out = at::Tensor();
+        int N = cu_seqlens.has_value() ? cu_seqlens->size() - 1 : B;
+        auto state_options = initial_state.has_value() ? initial_state->options() : h_out.options();
+        final_state_out = at::empty({N, HV, K, V}, state_options);
     }
 
     // 调用ACLNN算子（两阶段调用：先获取工作空间大小，再执行）
