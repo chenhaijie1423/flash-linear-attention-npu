@@ -229,6 +229,26 @@ inputs:
         values: [true, false]
       invalid:
         values: []
+  - name: use_exp2
+    type: attr
+    required: true
+    dtypes:
+      values: [bool]
+    ranges:
+      valid:
+        values: [false]
+      invalid:
+        values: []
+  - name: transpose_state_layout
+    type: attr
+    required: true
+    dtypes:
+      values: [bool]
+    ranges:
+      valid:
+        values: [false]
+      invalid:
+        values: []
   - name: qkv_type
     type: attr
     required: true

@@ -271,6 +271,8 @@ class FunctionApi(BaseApi):
         input_data.kwargs['chunk_indices'] = chunk_indices
         input_data.kwargs['scale'] = scale
         input_data.kwargs['chunk_size'] = chunk_size
+        input_data.kwargs['use_exp2'] = False
+        input_data.kwargs['transpose_state_layout'] = False
         input_data.kwargs["g_gamma"] = None
         input_data.kwargs.pop("is_mix", None)
         input_data.kwargs.pop("is_fix", None)

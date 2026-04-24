@@ -95,23 +95,24 @@ def chunk_bwd_dqkwg_cpu(
     do.to(torch.float32)
     h.to(torch.float32)
     dh.to(torch.float32)
-    # w.to(torch.float32)
     
     g.to(torch.float32)
     dv.to(torch.float32)
-    B, T, H, K = q.shape
+    B, T, HK, K = q.shape
+    HV = v.shape[2]
     V = v.shape[-1]
+    n_ratio = HV // HK  # HV = n_ratio * HK
     datatype = q.dtype
     gtype = g.dtype
     calctype = torch.float32
     g_gamma = None
-    # print(f"h {h.dtype}")
     
-    dq = torch.zeros_like(q)
-    dk = torch.zeros_like(k)
+    # 输出使用 HV 维度
+    dq = torch.zeros((B, T, HV, K), dtype=datatype)
+    dk = torch.zeros((B, T, HV, K), dtype=datatype)
     dg = torch.zeros_like(g) if g is not None else None
-    dw = torch.zeros_like(q)
-    w = torch.zeros_like(q)
+    dw = torch.zeros((B, T, HV, K), dtype=datatype)
+    w = torch.zeros((B, T, HV, K), dtype=datatype)
 
     
     # 辅助函数：处理单个序列的逻辑
@@ -122,7 +123,9 @@ def chunk_bwd_dqkwg_cpu(
         # print("H(head)", H, "num_chunks", num_chunks, "b_idx", b_idx, "t_start", t_start, "t_end", t_end, "seq_idx_in_batch", seq_idx_in_batch, "chunk_start_idx", chunk_start_idx)
 
         
-        for h_idx in range(H):
+        for h_idx in range(HV):
+            # h_idx is hv_idx; compute hk_idx for q/k access
+            hk_idx = h_idx // n_ratio
             # 获取当前头的 gamma (如果 USE_G_GAMMA)
             gamma_val = None
             if g_gamma is not None:
@@ -142,8 +145,9 @@ def chunk_bwd_dqkwg_cpu(
                 
                 # 切片当前块的数据
                 
-                q_c = q[b_idx, chunk_start_token_idx:chunk_end_token_idx, h_idx, :]  # [BT, K]
-                k_c = k[b_idx, chunk_start_token_idx:chunk_end_token_idx, h_idx, :]  # [BT, K]
+                q_c = q[b_idx, chunk_start_token_idx:chunk_end_token_idx, hk_idx, :]  # [BT, K]
+                k_c = k[b_idx, chunk_start_token_idx:chunk_end_token_idx, hk_idx, :]  # [BT, K]
+
                 v_c = v[b_idx, chunk_start_token_idx:chunk_end_token_idx, h_idx, :]  # [BT, V]
                 do_c = do[b_idx, chunk_start_token_idx:chunk_end_token_idx, h_idx, :] # [BT, V]
 

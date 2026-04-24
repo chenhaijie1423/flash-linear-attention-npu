@@ -9,7 +9,7 @@ export TMPDIR=/data/huangjunzhe/tmp
 
 ascend_path_orig=${ascend_path}/../
 custom_path="/home/huangjunzhe/GDN/custom"
-code_path=${test_script_path}/../../../
+code_path=${test_script_path}/../../../../../../../
 source ${ascend_path}/set_env.sh
 
 compi=$1
@@ -36,7 +36,7 @@ if [ "$compi" = "$compi_y" ]; then
         exit 1
     fi
     unset ASCEND_CUSTOM_OPP_PATH
-    bash ${code_path}/build/cann-ops-transformer-custom_linux-aarch64.run #--install-path=${custom_path}
+    bash ${code_path}/build/fla-npu-custom_linux-aarch64.run #--install-path=${custom_path}
     if [ $? -ne 0 ]; then
         exit 1
     fi
@@ -68,15 +68,15 @@ fi
 # python3 /root/data_nvme0n1/huangjunzhe/GDN/target/result/to_pt.py /root/data_nvme0n1/huangjunzhe/GDN/target/result/cpu_model
 
 
-ct single ${data_path}/${caseid}/out/dw_npu.pt ${data_path}/${caseid}/out/dw_cpu.pt --calc_count 100000 --dtype float16
-ct single ${data_path}/${caseid}/out/dg_npu.pt ${data_path}/${caseid}/out/dg_cpu.pt --calc_count 100000 --dtype float16
-ct single ${data_path}/${caseid}/out/dq_npu.pt ${data_path}/${caseid}/out/dq_cpu.pt --calc_count 100000 --dtype float16
-ct single ${data_path}/${caseid}/out/dk_npu.pt ${data_path}/${caseid}/out/dk_cpu.pt --calc_count 100000 --dtype float16
+# ct single ${data_path}/${caseid}/out/dw_npu.pt ${data_path}/${caseid}/out/dw_cpu.pt --calc_count 100000 --dtype float16
+# ct single ${data_path}/${caseid}/out/dg_npu.pt ${data_path}/${caseid}/out/dg_cpu.pt --calc_count 100000 --dtype float16
+# ct single ${data_path}/${caseid}/out/dq_npu.pt ${data_path}/${caseid}/out/dq_cpu.pt --calc_count 100000 --dtype float16
+# ct single ${data_path}/${caseid}/out/dk_npu.pt ${data_path}/${caseid}/out/dk_cpu.pt --calc_count 100000 --dtype float16
 
 
-ct viz ${data_path}/${caseid}/out/dw_npu.pt ${data_path}/${caseid}/out/dw_cpu.pt --out_dir ${data_path}/${caseid} --name dw
-ct viz ${data_path}/${caseid}/out/dg_npu.pt ${data_path}/${caseid}/out/dg_cpu.pt --out_dir ${data_path}/${caseid} --name dg
-ct viz ${data_path}/${caseid}/out/dq_npu.pt ${data_path}/${caseid}/out/dq_cpu.pt --out_dir ${data_path}/${caseid} --name dq
-ct viz ${data_path}/${caseid}/out/dk_npu.pt ${data_path}/${caseid}/out/dk_cpu.pt --out_dir ${data_path}/${caseid} --name dk
+ct viz ${data_path}/${caseid}/out/dw_npu.pt ${data_path}/${caseid}/out/dw_cpu.pt --out_dir ${data_path}/${caseid} --name dw -wl 1
+ct viz ${data_path}/${caseid}/out/dg_npu.pt ${data_path}/${caseid}/out/dg_cpu.pt --out_dir ${data_path}/${caseid} --name dg -wl 1
+ct viz ${data_path}/${caseid}/out/dq_npu.pt ${data_path}/${caseid}/out/dq_cpu.pt --out_dir ${data_path}/${caseid} --name dq -wl 1
+ct viz ${data_path}/${caseid}/out/dk_npu.pt ${data_path}/${caseid}/out/dk_cpu.pt --out_dir ${data_path}/${caseid} --name dk -wl 1
 
 md5sum ${data_path}/${caseid}/out/*.pt
