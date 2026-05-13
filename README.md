@@ -32,11 +32,11 @@ source $INSTALL_PATH/ascend-toolkit/set_env.sh
 编译GDN算子run包并安装
 
 ```
-# 编译命令，注意--soc=${soc_version}需要指定为当前机器的芯片类型{ascend910b/ascend910_93/ascend950}
-bash build.sh --soc=ascend910_93 --pkg --ops=causal_conv1d,chunk_bwd_dv_local,chunk_bwd_dqkwg,chunk_gated_delta_rule_bwd_dhu,prepare_wy_repr_bwd_da,prepare_wy_repr_bwd_full,chunk_fwd_o,chunk_gated_delta_rule_fwd_h,recurrent_gated_delta_rule,recompute_wu_fwd
+# 编译命令，注意 --soc=${soc_version} 需指定为当前机器芯片类型 {ascend910b/ascend910_93/ascend950}
+bash build.sh --soc=ascend910_93 --pkg --vendor_name=fla_npu
 
-# 安装run包
-./build_out/cann-*.run
+# 安装 run 包（custom 包名：fla-npu-<vendor>_linux-<arch>.run）
+./build_out/fla-npu-*.run
 ```
 
 ### ​torch_custom 框架编译构建

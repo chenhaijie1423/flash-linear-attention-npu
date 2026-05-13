@@ -12,8 +12,10 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 import torch
+import torch.nn as nn
 import torch_npu
 
+from triton_ops.triton_core.causal_conv1d import causal_conv1d_triton
 from triton_ops.triton_core.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from triton_ops.triton_core.cumsum import chunk_local_cumsum
 from triton_ops.triton_core.l2norm import l2norm_bwd, l2norm_fwd
@@ -598,12 +600,142 @@ def flash_gated_delta_rule(
     return o, final_state
 
 
+class QwenStyleRMSNormGated(nn.Module):
+    """RMSNorm + gated SiLU."""
+
+    def __init__(self, head_v_dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(head_v_dim))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        weight = self.weight
+        inp_dtype = hidden_states.dtype
+        hidden_states = torch_npu.npu_rms_norm(hidden_states, weight, self.variance_epsilon)[0]
+        hidden_states = hidden_states * torch.nn.functional.silu(gate.to(hidden_states.dtype))
+        return hidden_states.to(inp_dtype)
+
+
+class DemoGatedDeltaNet(nn.Module):
+
+    def __init__(
+        self,
+        hidden_size: int,
+        *,
+        num_value_heads: int,
+        num_key_heads: int,
+        key_head_dim: int,
+        value_head_dim: int,
+        conv_kernel_dim: int,
+        hidden_act: str = "silu",
+        rms_norm_eps: float = 1e-6,
+        chunk_size: int = 64,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_v_heads = num_value_heads
+        self.num_k_heads = num_key_heads
+        self.head_k_dim = key_head_dim
+        self.head_v_dim = value_head_dim
+        self.key_dim = self.head_k_dim * self.num_k_heads
+        self.value_dim = self.head_v_dim * self.num_v_heads
+        self.conv_kernel_size = conv_kernel_dim
+        self.activation = hidden_act
+        self.chunk_size_default = chunk_size
+
+        conv_dim = self.key_dim * 2 + self.value_dim
+        self.conv1d = nn.Conv1d(
+            in_channels=conv_dim,
+            out_channels=conv_dim,
+            bias=False,
+            kernel_size=self.conv_kernel_size,
+            groups=conv_dim,
+            padding=self.conv_kernel_size - 1,
+        )
+        self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
+        self.A_log = nn.Parameter(torch.log(torch.rand(self.num_v_heads) * 15.99 + 0.01))
+        self.in_proj_qkv = nn.Linear(self.hidden_size, conv_dim, bias=False)
+        self.in_proj_z = nn.Linear(self.hidden_size, self.value_dim, bias=False)
+        self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
+        self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
+        self.norm = QwenStyleRMSNormGated(self.head_v_dim, eps=rms_norm_eps)
+        self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
+
+    def forward(self, hidden_states: torch.Tensor, cu_seqlens: Optional[torch.LongTensor] = None) -> torch.Tensor:
+        batch_size, seq_len, _ = hidden_states.shape
+        if batch_size != 1:
+            raise ValueError("DemoGatedDeltaNet 仅对齐 xtuner bs=1 路径")
+
+        mixed_qkv = self.in_proj_qkv(hidden_states)
+        z = self.in_proj_z(hidden_states).reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
+
+        b = self.in_proj_b(hidden_states)
+        a = self.in_proj_a(hidden_states)
+
+        weight = self.conv1d.weight.squeeze(1)
+        bias = self.conv1d.bias
+
+        if cu_seqlens is not None and cu_seqlens.device != mixed_qkv.device:
+            cu_seqlens = cu_seqlens.to(mixed_qkv.device)
+
+        mixed_qkv, _ = causal_conv1d_triton(
+            mixed_qkv,
+            weight=weight,
+            H=2 * self.num_k_heads + self.num_v_heads,
+            bias=bias,
+            residual=None,
+            initial_state=None,
+            activation=self.activation,
+            cu_seqlens=cu_seqlens,
+            output_final_state=False,
+        )
+
+        query, key, value = mixed_qkv.split([self.key_dim, self.key_dim, self.value_dim], dim=-1)
+        query = query.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim).transpose(1, 2).contiguous()
+        key = key.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim).transpose(1, 2).contiguous()
+        value = value.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim).transpose(1, 2).contiguous()
+
+        beta = b.sigmoid()
+        g = -self.A_log.float().exp() * torch.nn.functional.softplus(a.float() + self.dt_bias)
+
+        repeat = self.num_v_heads // self.num_k_heads
+        if repeat > 1:
+            query = query.repeat_interleave(repeat, dim=1)
+            key = key.repeat_interleave(repeat, dim=1)
+
+        cu_list = cu_seqlens.detach().tolist() if cu_seqlens is not None else None
+        cu_seqlens_list: Optional[list[int]] = cu_list if cu_list is not None else None
+
+        core_attn_out, _ = flash_gated_delta_rule(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_list=cu_seqlens_list,
+            chunk_indices=None,
+            chunk_indices_list=None,
+            chunk_size=self.chunk_size_default,
+        )
+
+        core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
+        z_flat = z.reshape(-1, self.head_v_dim)
+        core_attn_out = self.norm(core_attn_out, z_flat)
+        core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
+        return self.out_proj(core_attn_out)
+
+
 __all__ = [
     "flash_gated_delta_rule",
     "flash_chunk_gated_delta_rule_fwd",
     "flash_chunk_gated_delta_rule_bwd",
     "prepare_chunk_indices",
     "prepare_chunk_indices_list",
+    "DemoGatedDeltaNet",
+    "QwenStyleRMSNormGated",
 ]
 
 
@@ -662,6 +794,12 @@ def _main():
     parser.add_argument("--chunk-size", type=int, default=64)
     parser.add_argument("--dtype", choices=["fp16", "bf16"], default="bf16")
     parser.add_argument("--mean-len", type=int, default=1024)
+    parser.add_argument(
+        "--demo-model",
+        action="store_true",
+        help="运行 DemoGatedDeltaNet（从 cu_seqlens 迁移到 tensor 设备及 causal_conv 起始的完整链路）代替裸张量 attn 冒烟",
+    )
+    parser.add_argument("--conv-kernel", type=int, default=4, help="depthwise causal conv kernel size")
     args = parser.parse_args()
 
     torch.npu.set_device(args.device)
@@ -671,6 +809,42 @@ def _main():
     varlen = True
     batch = 1
     device = f"npu:{args.device}"
+
+    if args.demo_model:
+        hidden_size = args.heads * args.dim
+        if hidden_size <= 0:
+            raise ValueError("hidden_size = heads * dim 非法")
+        cu_seqlens = _build_mean_1k_cu_seqlens(
+            total_tokens=args.tokens,
+            chunk_size=args.chunk_size,
+            device=device,
+            mean_len=args.mean_len,
+        )
+        x = torch.randn(1, args.tokens, hidden_size, dtype=dtype, device=device, requires_grad=True)
+        net = DemoGatedDeltaNet(
+            hidden_size,
+            num_value_heads=args.heads,
+            num_key_heads=args.heads,
+            key_head_dim=args.dim,
+            value_head_dim=args.value_dim,
+            conv_kernel_dim=args.conv_kernel,
+            chunk_size=args.chunk_size,
+        ).to(device=device, dtype=dtype)
+        torch.npu.synchronize()
+        out = net(x, cu_seqlens=cu_seqlens)
+        torch.npu.synchronize()
+        print("demo_model forward:", tuple(out.shape), out.dtype, "finite:", torch.isfinite(out.float()).all().item())
+        loss = out.float().square().mean()
+        loss.backward()
+        torch.npu.synchronize()
+        print("demo_model backward ok")
+        print(
+            "x.grad finite:",
+            torch.isfinite(x.grad.float()).all().item() if x.grad is not None else None,
+            "norm:",
+            float(x.grad.float().norm()) if x.grad is not None else None,
+        )
+        return
 
     q = torch.randn(batch, args.heads, args.tokens, args.dim, dtype=dtype, device=device)
     k = torch.randn(batch, args.heads, args.tokens, args.dim, dtype=dtype, device=device)
