@@ -481,13 +481,15 @@ def test_prepare_wy_repr_bwd_full(
     try:
         import ct
         cpu_dv = compute_dv_golden(A, du, beta, cu_seqlens, chunk_indices, B, HV, T, K, chunk_size, NT)
-        cpu_dk = compute_dk_golden(A, dw, g, beta, dA,k, cu_seqlens, chunk_indices, B, HK, HV, T, K, chunk_size, NT)
-        cpu_dg = compute_dg_golden(A, dw, g, beta, dA,k, cu_seqlens, chunk_indices, B, HK, HV, T, K, chunk_size, NT)
-        cpu_dbeta = compute_dbeta_golden(A, dw, g, beta, dA,k,v,du, cu_seqlens, chunk_indices, B, HK, HV, T, K, chunk_size, NT)
         ct.isclose(dv.cpu(), cpu_dv, diff_thd=0.1)
+        cpu_dk = compute_dk_golden(A, dw, g, beta, dA,k, cu_seqlens, chunk_indices, B, HK, HV, T, K, chunk_size, NT)
         ct.isclose(dk.cpu(), cpu_dk, diff_thd=0.1)
+        cpu_dg = compute_dg_golden(A, dw, g, beta, dA,k, cu_seqlens, chunk_indices, B, HK, HV, T, K, chunk_size, NT)
         ct.isclose(dg.cpu(), cpu_dg, diff_thd=0.1)
+        cpu_dbeta = compute_dbeta_golden(A, dw, g, beta, dA,k,v,du, cu_seqlens, chunk_indices, B, HK, HV, T, K, chunk_size, NT)
         ct.isclose(dbeta.cpu(), cpu_dbeta, diff_thd=0.1)
+    finally:
+        pass
     # torch.save(cpu_dbeta, "cpu_dbeta.pt") 
     
     print(f"test_prepare_wy_repr_bwd_full 被调用了第 {test_prepare_wy_repr_bwd_full.call_count} 次")
