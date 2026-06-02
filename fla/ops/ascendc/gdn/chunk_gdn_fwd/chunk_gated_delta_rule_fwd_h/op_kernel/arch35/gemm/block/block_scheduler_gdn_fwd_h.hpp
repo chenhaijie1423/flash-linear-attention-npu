@@ -20,6 +20,7 @@ constexpr uint32_t BYTES_PER_C0 = 32;
 constexpr uint32_t BYTE_SIZE_PER_REPEAT = 256;
 constexpr uint32_t SIZE_16_NUM_PER_C0 = BYTES_PER_C0 / BYTE_SIZE_16_BIT;
 constexpr uint32_t FLOAT_NUM_PER_REPEAT = BYTE_SIZE_PER_REPEAT / sizeof(float);
+constexpr uint32_t NZ_BLOCK_SIZE = 16;
 
 template <typename T>
 CATLASS_DEVICE T AlignUp(T a, T b) {
@@ -95,6 +96,7 @@ struct BlockSchedulerGdnFwdH {
     uint32_t tokenBatch;
     bool useInitialState;
     bool storeFinalState;
+    uint32_t numSeqWorkspaceOffset;
     uint32_t numChunksWorkspaceOffset;
 
     uint32_t taskIdx;
@@ -117,6 +119,7 @@ struct BlockSchedulerGdnFwdH {
     bool isRunning;
 
     AscendC::GlobalTensor<int64_t> gmSeqlen;
+    AscendC::GlobalTensor<int64_t> gmNumSeq;
     AscendC::GlobalTensor<int64_t> gmNumChunks;
 
     Arch::CrossCoreFlag cube1Done{0};
@@ -143,10 +146,36 @@ struct BlockSchedulerGdnFwdH {
         tokenBatch = gdnFwdHTilingData->tokenBatch;
         useInitialState = gdnFwdHTilingData->useInitialState;
         storeFinalState = gdnFwdHTilingData->storeFinalState;
+        numSeqWorkspaceOffset = gdnFwdHTilingData->numSeqWorkspaceOffset;
         numChunksWorkspaceOffset = gdnFwdHTilingData->numChunksWorkspaceOffset;
 
         gmSeqlen.SetGlobalBuffer((__gm__ int64_t *)cu_seqlens);
+        gmNumSeq.SetGlobalBuffer((__gm__ int64_t *)(user + numSeqWorkspaceOffset));
         gmNumChunks.SetGlobalBuffer((__gm__ int64_t *)(user + numChunksWorkspaceOffset));
+
+        if (isVariedLen) {
+            gmNumChunks.SetValue(0, 0);
+            uint32_t actualBatch = 0;
+            int64_t prevSeq = 0, currSeq;
+            for (uint32_t b = 1; b <= tokenBatch; b++) {
+                currSeq = gmSeqlen.GetValue(b);
+                int64_t batchSeqLen = currSeq - prevSeq;
+                if (batchSeqLen > 0) {
+                    actualBatch++;
+                    gmNumSeq.SetValue(actualBatch, currSeq);
+                    int64_t batchChunk = (batchSeqLen + chunkSize - 1) / chunkSize;
+                    gmNumChunks.SetValue(actualBatch, gmNumChunks.GetValue(actualBatch - 1) + batchChunk);
+                }
+                prevSeq = currSeq;
+            }
+            tokenBatch = actualBatch;
+            batch = actualBatch;
+            totalChunks = gmNumChunks.GetValue(tokenBatch);
+            totalTokens = gmNumSeq.GetValue(tokenBatch);
+        } else {
+            totalChunks = (seqlen + chunkSize - 1) / chunkSize;
+            totalTokens = seqlen;
+        }
 
         cubeCoreIdx = coreIdx;
         cubeCoreNum = coreNum;
@@ -172,19 +201,6 @@ struct BlockSchedulerGdnFwdH {
         taskIdx = curLoopTaskBegin + PING_PONG_STAGES; // 第一次创建task时重新初始化taskIdx
         isRunning = curLoopTaskBegin < taskNum;
 
-        if (isVariedLen) {
-            gmNumChunks.SetValue(0, 0); //
-            for (uint32_t b = 1; b <= tokenBatch; b++) {
-                int64_t batchChunk = (gmSeqlen.GetValue(b) - gmSeqlen.GetValue(b - 1) + chunkSize - 1) / chunkSize;
-                gmNumChunks.SetValue(b, gmNumChunks.GetValue(b - 1) + batchChunk);
-            }
-            totalChunks = gmNumChunks.GetValue(tokenBatch);
-            totalTokens = gmSeqlen.GetValue(tokenBatch);
-        } else {
-            totalChunks = (seqlen + chunkSize - 1) / chunkSize;
-            totalTokens = seqlen;
-        }
-
     }
 
 
@@ -198,8 +214,8 @@ struct BlockSchedulerGdnFwdH {
         newStream.tokenBatchIdx = isVariedLen ? newStream.batchIdx : 0;
         newStream.chunkOffset = isVariedLen ? gmNumChunks.GetValue(newStream.tokenBatchIdx) : 0;
         newStream.batchChunks = isVariedLen ? (gmNumChunks.GetValue(newStream.tokenBatchIdx + 1) - newStream.chunkOffset) : totalChunks;
-        newStream.tokenOffset = isVariedLen ? gmSeqlen.GetValue(newStream.tokenBatchIdx) : 0;
-        newStream.batchTokens = isVariedLen ? (gmSeqlen.GetValue(newStream.tokenBatchIdx + 1) - newStream.tokenOffset) : totalTokens;
+        newStream.tokenOffset = isVariedLen ? gmNumSeq.GetValue(newStream.tokenBatchIdx) : 0;
+        newStream.batchTokens = isVariedLen ? (gmNumSeq.GetValue(newStream.tokenBatchIdx + 1) - newStream.tokenOffset) : totalTokens;
         newStream.chunkIdx = 0;
     }
      

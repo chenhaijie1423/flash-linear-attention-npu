@@ -24,14 +24,16 @@ template <
     class VOutputType_,
     class GInputType_,
     class UInputType_,
-    class WSInputType_
+    class WSInputType_,
+    class FinalStateType_
 >
 class BlockEpilogue <
     EpilogueAtlasGDNFwdHVnew,
     VOutputType_,
     GInputType_,
     UInputType_,
-    WSInputType_
+    WSInputType_,
+    FinalStateType_
 > {
 public:
     // Type aliases
@@ -42,6 +44,7 @@ public:
     using GElementInput = typename GInputType_::Element;
     using UElementInput = typename UInputType_::Element;
     using WSElementInput = typename WSInputType_::Element;
+    using FinalStateElement = typename FinalStateType_::Element;
 
     CATLASS_DEVICE
     BlockEpilogue(Arch::Resource<ArchTag> &resource)
@@ -103,7 +106,10 @@ public:
         uint32_t vHeadDim,
         Arch::CrossCoreFlag cube1Done,
         Arch::CrossCoreFlag vec1Done,
-        bool isInitialState 
+        bool isInitialState,
+        bool isFinalState,
+        bool storeFinalState,
+        bool isPing
     )
     {
         uint32_t mActual = chunkSize;
@@ -202,7 +208,11 @@ public:
 
         Arch::CrossCoreWaitFlag(cube1Done);
 
-        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0 + pingpongFlag);
+        if (storeFinalState && isInitialState && std::is_same<FinalStateElement, float>::value) {
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0 + pingpongFlag);
+        } else {
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0 + pingpongFlag);
+        }
         AscendC::DataCopy(wsUbTensor, wsInputThisSubBlock, mActualThisSubBlock * nvActual);
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0 + pingpongFlag);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0 + pingpongFlag);
@@ -235,12 +245,10 @@ public:
         AscendC::DataCopy(vnewOutputThisSubBlock, vNewOutputUbTensor, mActualThisSubBlock * nvActual);
         AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1 + pingpongFlag);
 
-        isPing = !isPing;
     }
 
 private:
     uint32_t pongBaseEvent = 4;
-    bool isPing = true;
 
     AscendC::LocalTensor<float> calcUbTensor;
 

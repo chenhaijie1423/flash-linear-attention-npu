@@ -25,7 +25,8 @@ template <
     class GInputType_,
     class UInputType_,
     class WSInputType_,
-    class VUpdateType_
+    class VUpdateType_,
+    class FinalStateType_
 >
 class BlockEpilogue <
     EpilogueAtlasGDNFwdHVnew,
@@ -33,7 +34,8 @@ class BlockEpilogue <
     GInputType_,
     UInputType_,
     WSInputType_,
-    VUpdateType_
+    VUpdateType_,
+    FinalStateType_
 > {
 public:
     // Type aliases
@@ -46,6 +48,7 @@ public:
     using WSElementInput = typename WSInputType_::Element;
     using VElementUpdate = typename VUpdateType_::Element;
     using VLayoutUpdate = typename VUpdateType_::Layout;
+    using FinalStateElement = typename FinalStateType_::Element;
 
     CATLASS_DEVICE
     BlockEpilogue(Arch::Resource<ArchTag> &resource)
@@ -109,6 +112,8 @@ public:
         Arch::CrossCoreFlag cube1Done,
         Arch::CrossCoreFlag vec1Done,
         bool isInitialState,
+        bool isFinalState,
+        bool storeFinalState,
         bool isPing
     )
     {
@@ -208,6 +213,9 @@ public:
 
         Arch::CrossCoreWaitFlag(cube1Done);
 
+        if (storeFinalState && isInitialState && std::is_same<FinalStateElement, float>::value) {
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0 + pingpongFlag);
+        }
         AscendC::Sub<float>(wsUbTensor, calcUbTensor, wsUbTensor, mActualThisSubBlock * nvActual);
         AscendC::PipeBarrier<PIPE_V>();
         
@@ -230,11 +238,12 @@ public:
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID1 + pingpongFlag);
         
         uint32_t ubToL1Loops = nvActual / SIZE_16_NUM_PER_C0;
+        uint32_t mActualPadded = (mActual + NZ_BLOCK_SIZE - 1) / NZ_BLOCK_SIZE * NZ_BLOCK_SIZE;
         AscendC::DataCopyParams intriParams;
         intriParams.blockCount = ubToL1Loops;
         intriParams.blockLen = mActualThisSubBlock;
         intriParams.srcGap = 0;
-        intriParams.dstGap = mActual - mActualThisSubBlock;
+        intriParams.dstGap = mActualPadded - mActualThisSubBlock;
         uint32_t l1Addr = mOffset * SIZE_16_NUM_PER_C0;
         AscendC::DataCopy(l1VUpdate[l1Addr], vNewDecayUbTensor, intriParams);
 
