@@ -172,7 +172,7 @@ jobs:
         with:
           repository: ${{ needs.prepare.outputs.head_repo }}
           ref: ${{ needs.prepare.outputs.head_sha }}
-          fetch-depth: 0
+          fetch-depth: 1
           path: repo
 
       - name: Checkout trusted CI scripts

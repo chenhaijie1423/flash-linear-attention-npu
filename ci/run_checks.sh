@@ -6,16 +6,26 @@ cd "$repo_dir"
 
 if [[ -f /usr/local/Ascend/ascend-toolkit/latest/set_env.sh ]]; then
     # shellcheck disable=SC1091
+    set +u
     source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh
+    set -u
 elif [[ -f /usr/local/Ascend/ascend-toolkit/set_env.sh ]]; then
     # shellcheck disable=SC1091
+    set +u
     source /usr/local/Ascend/ascend-toolkit/set_env.sh
+    set -u
 fi
 
 if command -v npu-smi >/dev/null 2>&1; then
-    bash ci/detect_npu.sh --summary || true
-    if [[ -z "${NPU_SELECTED_DEVICE:-}" ]]; then
-        eval "$(bash ci/detect_npu.sh --env)" || true
+    if [[ -n "${NPU_SELECTED_DEVICE:-}" ]]; then
+        if ! summary="$(bash ci/detect_npu.sh --summary 2>&1)"; then
+            echo "[CI][WARN] Container npu-smi did not report devices; using host-selected NPU ${NPU_SELECTED_DEVICE}."
+        else
+            echo "$summary"
+        fi
+    else
+        eval "$(bash ci/detect_npu.sh --env)"
+        bash ci/detect_npu.sh --summary
     fi
 fi
 
