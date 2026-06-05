@@ -33,17 +33,23 @@ ci_mode="${CI_MODE:-quick}"
 ci_soc="${CI_SOC:-${NPU_SOC:-ascend910b}}"
 ci_ops="${CI_OPS:-}"
 ci_jobs="${CI_JOBS:-$(nproc)}"
+ci_cpack_jobs="${CI_CPACK_JOBS:-$ci_jobs}"
 
 if [[ "$ci_soc" == "unknown" ]]; then
     ci_soc="ascend910b"
 fi
+
+export CMAKE_BUILD_PARALLEL_LEVEL="$ci_cpack_jobs"
+export MAKEFLAGS="${MAKEFLAGS:+$MAKEFLAGS }-j${ci_cpack_jobs}"
+
+bash ci/prepare_ci_cache.sh
 
 ops_arg=()
 if [[ -n "$ci_ops" ]]; then
     ops_arg=(--ops="$ci_ops")
 fi
 
-echo "[CI] mode=$ci_mode soc=$ci_soc ops=${ci_ops:-<all>} jobs=$ci_jobs"
+echo "[CI] mode=$ci_mode soc=$ci_soc ops=${ci_ops:-<all>} jobs=$ci_jobs cpack_jobs=$ci_cpack_jobs"
 
 case "$ci_mode" in
     quick)

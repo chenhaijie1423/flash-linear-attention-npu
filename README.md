@@ -131,6 +131,13 @@ bash ci/run_ci_container.sh
 | `CI_BUILD_TORCH_CUSTOM` | `false` | 为 `true` 时额外编译 `torch_custom/fla_npu` |
 | `CI_RUN_TORCH_TESTS` | `false` | 为 `true` 时额外执行 `torch_custom/fla_npu/test/test.sh` |
 | `CI_RUN_EXAMPLE_ST` | `false` | 为 `true` 时额外执行 `examples/flash_gated_delta_rule.py` |
+| `CI_CACHE_ROOT` | `/workspace/flash-linear-attention-npu-ci/cache` | self-hosted runner 上的持久 CI 缓存根目录 |
+| `CI_THIRD_PARTY_CACHE` | `$CI_CACHE_ROOT/third_party` | 挂载到容器 `/workspace/repo/third_party` 的三方依赖缓存目录 |
+| `CI_CPACK_JOBS` | `$CI_JOBS` | 传给 `CMAKE_BUILD_PARALLEL_LEVEL`/`MAKEFLAGS`，用于加速 cpack 内部 preinstall 构建 |
+| `CI_FORCE_CLEAN_CACHE` | `false` | 为 `true` 时强制清理 `build/`、`build_out/`、`output/` 和三方依赖缓存 |
+| `CI_SEED_THIRD_PARTY` | `true` | 为 `true` 时从 CI 镜像的 `/opt/fla-ci/third_party` 预烘种子填充三方缓存 |
+
+CI 会对 `build.sh`、`CMakeLists.txt`、`cmake/`、`ci/`、`scripts/package/`、`scripts/util/`、`scripts/ci/`、依赖清单等构建输入计算签名。若新增三方引用、修改三方版本、调整 CMake/打包/CI 编译流程，签名变化后会自动删除 `build/`、`build_out/`、`output/` 并清空三方缓存，随后重新走完整编译。
 
 ### 触发 NPU CI
 
