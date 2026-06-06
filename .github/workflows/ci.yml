@@ -29,7 +29,8 @@ jobs:
       (
         github.event_name == 'issue_comment' &&
         github.event.issue.pull_request &&
-        startsWith(github.event.comment.body, '/run-npu-ci')
+        github.actor != 'github-actions[bot]' &&
+        contains(github.event.comment.body, '/run-npu-ci')
       )
     runs-on: ubuntu-latest
     permissions:
@@ -153,6 +154,11 @@ jobs:
             } else {
               prNumber = context.payload.issue.number;
               const body = (context.payload.comment.body || '').trim();
+              if (!body.startsWith('/run-npu-ci')) {
+                core.notice('评论包含 /run-npu-ci，但去掉首尾空白后不是以触发命令开头，跳过。');
+                core.setOutput('should_run', 'false');
+                return;
+              }
               const parts = body.split(/\s+/).slice(1);
               for (const part of parts) {
                 if (part === 'quick' || part === 'full') {
