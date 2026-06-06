@@ -4,6 +4,8 @@ set -euo pipefail
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_dir"
 
+bash ci/cleanup_ci_logs.sh
+
 if [[ -f /usr/local/Ascend/ascend-toolkit/latest/set_env.sh ]]; then
     # shellcheck disable=SC1091
     set +u

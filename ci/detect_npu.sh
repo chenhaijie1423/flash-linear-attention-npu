@@ -2,6 +2,7 @@
 set -euo pipefail
 
 mode="${1:---summary}"
+target_id="${2:-}"
 
 if ! command -v npu-smi >/dev/null 2>&1; then
     echo "npu-smi is not available" >&2
@@ -68,6 +69,44 @@ select_device() {
     echo "${ids[0]}"
 }
 
+emit_candidates() {
+    local id
+    for id in "${ids[@]}"; do
+        if [[ "${health[$id]}" == "OK" && "${free[$id]:-0}" == "1" ]]; then
+            echo "$id"
+        fi
+    done
+    for id in "${ids[@]}"; do
+        if [[ "${health[$id]}" != "OK" && "${free[$id]:-0}" == "1" ]]; then
+            echo "$id"
+        fi
+    done
+    for id in "${ids[@]}"; do
+        if [[ "${health[$id]}" == "OK" && "${free[$id]:-0}" != "1" ]]; then
+            echo "$id"
+        fi
+    done
+    for id in "${ids[@]}"; do
+        if [[ "${health[$id]}" != "OK" && "${free[$id]:-0}" != "1" ]]; then
+            echo "$id"
+        fi
+    done
+}
+
+emit_env_for() {
+    local id="$1"
+    if [[ -z "$id" || -z "${names[$id]+x}" ]]; then
+        echo "Unknown NPU device: ${id:-<empty>}" >&2
+        exit 2
+    fi
+    echo "NPU_AVAILABLE=1"
+    echo "NPU_SELECTED_DEVICE=$id"
+    echo "NPU_SELECTED_NAME=${names[$id]}"
+    echo "NPU_SELECTED_HEALTH=${health[$id]}"
+    echo "NPU_SELECTED_FREE=${free[$id]:-0}"
+    echo "NPU_SOC=$(soc_from_name "${names[$id]}")"
+}
+
 selected="$(select_device)"
 selected_soc="$(soc_from_name "${names[$selected]}")"
 selected_free="${free[$selected]:-0}"
@@ -80,12 +119,13 @@ case "$mode" in
         echo "$selected_soc"
         ;;
     --env)
-        echo "NPU_AVAILABLE=1"
-        echo "NPU_SELECTED_DEVICE=$selected"
-        echo "NPU_SELECTED_NAME=${names[$selected]}"
-        echo "NPU_SELECTED_HEALTH=${health[$selected]}"
-        echo "NPU_SELECTED_FREE=$selected_free"
-        echo "NPU_SOC=$selected_soc"
+        emit_env_for "$selected"
+        ;;
+    --env-for)
+        emit_env_for "$target_id"
+        ;;
+    --candidates)
+        emit_candidates
         ;;
     --summary)
         echo "Detected NPU devices:"
@@ -95,7 +135,7 @@ case "$mode" in
         echo "Selected NPU: id=$selected name=${names[$selected]} health=${health[$selected]} free=$selected_free soc=$selected_soc"
         ;;
     *)
-        echo "Usage: $0 [--summary|--env|--first-free|--selected|--soc]" >&2
+        echo "Usage: $0 [--summary|--env|--env-for <id>|--candidates|--first-free|--selected|--soc]" >&2
         exit 2
         ;;
 esac

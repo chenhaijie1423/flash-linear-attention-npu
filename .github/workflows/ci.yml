@@ -33,6 +33,7 @@ jobs:
       )
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: read
       issues: write
       pull-requests: read
@@ -47,7 +48,7 @@ jobs:
       example_args: ${{ steps.prepare.outputs.example_args }}
       comment_id: ${{ steps.prepare.outputs.comment_id }}
     steps:
-      - name: Resolve PR and requested CI mode
+      - name: 解析 PR 和 CI 参数
         id: prepare
         uses: actions/github-script@v7
         with:
@@ -118,6 +119,32 @@ jobs:
               }
             };
 
+            const isActivePendingStatus = async (status) => {
+              if (!status || status.state !== 'pending') {
+                return false;
+              }
+              if (!(status.description || '').includes('+example')) {
+                return false;
+              }
+              const targetUrl = status.target_url || '';
+              const match = targetUrl.match(/\/actions\/runs\/(\d+)/);
+              if (!match) {
+                core.warning('NPU CI pending status has no Actions run URL; treating it as active.');
+                return true;
+              }
+              try {
+                const { data: run } = await github.rest.actions.getWorkflowRun({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  run_id: Number(match[1]),
+                });
+                return ['queued', 'in_progress', 'waiting', 'pending', 'requested'].includes(run.status);
+              } catch (error) {
+                core.warning(`Unable to inspect NPU CI workflow run: ${error.message}`);
+                return true;
+              }
+            };
+
             if (context.eventName === 'workflow_dispatch') {
               prNumber = Number(core.getInput('pr_number', { required: true }));
               ciMode = core.getInput('ci_mode') || 'quick';
@@ -167,10 +194,13 @@ jobs:
               ref: pr.head.sha,
               per_page: 100,
             });
-            const latestManualCi = statuses.find((status) => status.context === contextName);
-            const latestPassedWithExample = latestManualCi &&
-              latestManualCi.state === 'success' &&
-              (latestManualCi.description || '').includes('+example');
+            const manualCiStatuses = statuses
+              .filter((status) => status.context === contextName)
+              .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+            const latestExecutionCi = manualCiStatuses
+              .find((status) => (status.description || '').includes('+example'));
+            const latestPassedWithExample = latestExecutionCi &&
+              latestExecutionCi.state === 'success';
             if (latestPassedWithExample) {
               core.notice(`${pr.head.sha} 已经通过 NPU CI，跳过重复运行。`);
               commentId = await upsertComment(
@@ -182,6 +212,30 @@ jobs:
                   `- 触发人：@${actor}`,
                   '- Example ST：已覆盖',
                 ].join('\n')
+              );
+              core.setOutput('should_run', 'false');
+              core.setOutput('pr_number', String(prNumber));
+              core.setOutput('head_repo', pr.head.repo.full_name);
+              core.setOutput('head_sha', pr.head.sha);
+              core.setOutput('ci_mode', ciMode);
+              core.setOutput('ops', ops);
+              core.setOutput('example_args', exampleArgs);
+              core.setOutput('comment_id', commentId);
+              return;
+            }
+            if (await isActivePendingStatus(latestExecutionCi)) {
+              core.notice(`${pr.head.sha} 已经有 NPU CI 在排队或运行，跳过重复启动。`);
+              commentId = await upsertComment(
+                pr,
+                [
+                  `NPU CI 已在验证 \`${pr.head.sha}\`，本次评论不会重复启动新任务。`,
+                  '',
+                  `- 请求模式：\`${ciMode}\``,
+                  `- 触发人：@${actor}`,
+                  '- 当前状态：排队或运行中',
+                  '- Example ST：必跑',
+                  latestExecutionCi.target_url ? `- 运行链接：[查看已有 NPU CI](${latestExecutionCi.target_url})` : '',
+                ].filter(Boolean).join('\n')
               );
               core.setOutput('should_run', 'false');
               core.setOutput('pr_number', String(prNumber));
@@ -243,7 +297,7 @@ jobs:
       CI_EXAMPLE_ARGS: ${{ needs.prepare.outputs.example_args }}
       CI_IMAGE: fla-npu-ci:8.5.0-910b
     steps:
-      - name: Checkout PR code
+      - name: 拉取 PR 代码
         uses: actions/checkout@v4
         with:
           repository: ${{ needs.prepare.outputs.head_repo }}
@@ -251,23 +305,23 @@ jobs:
           fetch-depth: 1
           path: repo
 
-      - name: Checkout trusted CI scripts
+      - name: 拉取可信 CI 脚本
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 1
           path: trusted-ci
 
-      - name: Use trusted CI scripts
+      - name: 使用可信 CI 脚本
         run: |
           rm -rf repo/ci
           cp -a trusted-ci/ci repo/ci
 
-      - name: Run NPU CI container
+      - name: 运行 NPU CI 容器
         working-directory: repo
         run: bash ci/run_ci_container.sh
 
-      - name: Publish NPU CI status
+      - name: 发布 NPU CI 状态
         if: always()
         uses: actions/github-script@v7
         with:

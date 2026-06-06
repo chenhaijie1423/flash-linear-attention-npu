@@ -30,13 +30,79 @@
    本仓 workflow 使用 `runs-on: [self-hosted, linux, arm64, npu, flash-linear-attention-npu]`。注册 runner 时需要带 `linux,arm64,npu,flash-linear-attention-npu` 这些标签，否则 workflow 会一直排队。
 
 8. **NPU CI 不会因为 PR 新建、重新打开、push 新 commit 自动执行。**
-   只能由维护者点击 GitHub Actions 按钮，或在 PR 评论里发送 `/run-npu-ci quick` / `/run-npu-ci full` 触发。PR 更新 commit 后，旧 commit 上的 CI 成功状态不会再满足合入门禁。
+   PR 新建、重新打开、push 新 commit 后，会自动出现 `NPU CI / 手动验证 pending`，描述为“未执行”，用于阻止未验证 commit 合入。真正执行 NPU CI 仍需要维护者点击 GitHub Actions 按钮，或在 PR 评论里发送 `/run-npu-ci quick` / `/run-npu-ci full` 触发。PR 更新 commit 后，旧 commit 上的 CI 成功状态不会再满足合入门禁。
 
 9. **分支保护里的状态检查名称要完全一致。**
    必需状态检查是 `仓库规则 / 维护者检视门禁` 和 `NPU CI / 手动验证`。名字写错、大小写不同、空格不同，GitHub 都会认为没有通过。
 
 10. **`weinachuan` 强行合入 bypass 不是写在代码里自动生效的。**
     需要 GitHub 管理员用 `scripts/github/apply_branch_protection.sh` 应用到 GitHub 分支保护规则。
+
+11. **多个 NPU CI 同时触发时有两层保护。**
+    同一 PR 的同一 head commit 如果已经有 `NPU CI / 手动验证` 处于 pending/running，重复评论只会更新机器人评论为“已在运行”，不会再次占用 NPU。runner 宿主机上还会用 `/tmp/fla-npu-ci-npu-<id>.lock` 对物理 NPU 加锁，避免多个 runner 抢同一张卡。
+
+12. **CI 容器内日志默认只保留 7 天。**
+    每次 NPU CI 容器启动时都会执行 `ci/cleanup_ci_logs.sh`，删除超过 7 天的 CI/Ascend/NPU 日志。这个策略只管理 CI 容器和仓库工作目录里的日志，不等同于 GitHub Actions 网页日志保留时间。
+
+## 流程图
+
+PR 新建或更新默认状态流程：
+
+```mermaid
+flowchart TD
+    A["PR 新建、重开或 push 新 commit"] --> B["NPU CI 默认状态 workflow 运行"]
+    B --> C{"当前 head commit 是否已有执行结果"}
+    C -- "有通过、失败或运行中状态" --> D["保留已有 NPU CI 状态"]
+    C -- "没有执行结果" --> E["写入 NPU CI / 手动验证 pending"]
+    E --> F["机器人评论：NPU CI 未执行"]
+    F --> G["提示可请求触发的维护账号和 /run-npu-ci 命令"]
+```
+
+评论触发总流程：
+
+```mermaid
+flowchart TD
+    A["维护者在 PR 评论 /run-npu-ci"] --> B["准备 NPU CI：解析 PR 和 head commit"]
+    B --> C{"触发人是否是维护账号"}
+    C -- "否" --> D["直接失败：无权触发"]
+    C -- "是" --> E{"当前 commit 是否已通过 NPU CI"}
+    E -- "是" --> F["更新机器人评论：已通过，不重复运行"]
+    E -- "否" --> G{"当前 commit 是否已有 NPU CI pending/running"}
+    G -- "是" --> H["更新机器人评论：已在运行，不重复启动"]
+    G -- "否" --> I["写入 NPU CI / 手动验证 pending 状态"]
+    I --> J["self-hosted runner 执行 Ascend NPU 验证"]
+    J --> K["写入通过或失败状态，并更新机器人评论"]
+```
+
+同一 PR + 同一 commit 重复触发流程：
+
+```mermaid
+flowchart LR
+    A["第一次评论"] --> B["创建 pending 状态"]
+    B --> C["runner 开始或排队运行"]
+    D["第二次评论"] --> E["prepare 读取当前 head commit 状态"]
+    E --> F{"已有 active pending?"}
+    F -- "是" --> G["只更新同一条机器人评论"]
+    G --> H["不启动新的 runner job"]
+    F -- "否" --> I["允许重新触发"]
+```
+
+runner 宿主机 NPU 加锁流程：
+
+```mermaid
+flowchart TD
+    A["runner 进入 ci/run_ci_container.sh"] --> B["扫描 npu-smi，生成候选 NPU 顺序"]
+    B --> C["尝试 flock /tmp/fla-npu-ci-npu-<id>.lock"]
+    C --> D{"是否拿到锁"}
+    D -- "是" --> E["设置 ASCEND_RT_VISIBLE_DEVICES=<id>"]
+    E --> F["启动 Docker 容器运行编译和 Example ST"]
+    F --> G["Docker 退出"]
+    G --> H["释放 NPU 锁"]
+    D -- "否" --> I{"是否还有候选卡"}
+    I -- "是" --> C
+    I -- "否" --> J["等待 CI_NPU_LOCK_RETRY_SECONDS 后重新扫描"]
+    J --> B
+```
 
 ## 你需要准备什么
 
@@ -116,6 +182,14 @@ Selected NPU: id=2 name=910B3 health=Alarm free=1 soc=ascend910b
 ```
 
 `health=Alarm` 不一定会阻止 CI，因为默认 `CI_REQUIRE_HEALTHY_NPU=false`。如果你希望只允许健康卡运行，可以在 runner 环境里设置 `CI_REQUIRE_HEALTHY_NPU=true`。
+
+查看 runner 会按什么顺序尝试加锁：
+
+```sh
+bash ci/detect_npu.sh --candidates
+```
+
+CI 会优先尝试健康且空闲的 NPU，然后尝试空闲但健康状态异常的 NPU。真正占用前还会拿 `/tmp/fla-npu-ci-npu-<id>.lock` 文件锁，拿不到锁时会继续尝试下一张卡。
 
 ## 第 4 步：准备 Docker 镜像
 
@@ -379,7 +453,13 @@ bash scripts/github/apply_branch_protection.sh main
 
 ## 第 10 步：验证触发方式
 
-本仓 NPU CI 不会被 PR 自动触发。维护者可以用两种方式手动触发。
+本仓 NPU CI 不会被 PR 自动执行。PR 新建、重开或 push 新 commit 时，GitHub 会自动给当前 head commit 写入 `NPU CI / 手动验证 pending`，描述为“未执行”。这个状态会出现在 PR checks 中，用来提醒该 commit 还没有完成 NPU CI。
+
+如果 PR push 了新 commit，默认状态会重新写到新的 head commit 上，描述为“commit 已变化，请重新触发”。旧 commit 的 NPU CI success 不会给新 commit 使用。
+
+机器人也会在 PR 评论区写入或更新一条提示，列出可以请求触发的维护账号，以及 `/run-npu-ci quick` / `/run-npu-ci full` 命令。
+
+维护者可以用两种方式手动触发真正的 NPU CI。
 
 触发后，GitHub 机器人会在 PR 评论区写入一条 NPU CI 状态评论。刚触发时显示“已开始”，执行完成后同一条评论会更新为“通过”或“失败”。如果 Actions 页面能看到 workflow 已触发，但 PR 下没有机器人评论，先检查下面两项：
 
@@ -416,10 +496,25 @@ bash scripts/github/apply_branch_protection.sh main
 - `zhangshuolei-hfut`
 - `chen-linxin`
 
-触发后，PR 当前 head commit 会出现状态：
+PR 新建或 push 新 commit 后，当前 head commit 会先出现默认状态：
 
 ```text
 NPU CI / 手动验证 pending
+未执行：请维护者评论 /run-npu-ci quick
+```
+
+如果是 push 新 commit，默认状态会显示：
+
+```text
+NPU CI / 手动验证 pending
+未执行：commit 已变化，请重新触发 /run-npu-ci quick
+```
+
+维护者触发执行后，仍会保持 pending，但描述会变成类似：
+
+```text
+NPU CI / 手动验证 pending
+NPU CI 已由 @weinachuan 触发 (quick+example)
 ```
 
 成功后会变成：
@@ -431,6 +526,28 @@ NPU CI / 手动验证 success
 PR 评论区也会出现或更新一条机器人评论，包含触发人、模式、Example ST 要求和 Actions run 链接。
 
 如果当前 head commit 已经成功跑过带 Example ST 的 NPU CI，重复触发会跳过，不再占用 NPU。
+
+如果当前 head commit 已经有 NPU CI 处于排队或运行中，重复评论也会跳过，不会再启动新的 self-hosted runner job。机器人评论会更新为“已在运行”，并指向已有 Actions run。
+
+不同 PR 或不同 commit 的 NPU CI 可以同时被触发。真正到 runner 宿主机执行时，`ci/run_ci_container.sh` 会为选中的物理 NPU 加文件锁，默认锁文件是 `/tmp/fla-npu-ci-npu-<id>.lock`。如果所有候选 NPU 都被锁住，job 会等待并重试。
+
+锁相关环境变量：
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `CI_NPU_LOCK_DIR` | `/tmp` | NPU 锁文件所在目录 |
+| `CI_NPU_LOCK_WAIT_SECONDS` | `14400` | 等待空闲 NPU 锁的最长时间，`0` 表示一直等待 |
+| `CI_NPU_LOCK_RETRY_SECONDS` | `10` | 所有 NPU 都被锁住时的重试间隔 |
+
+日志清理相关环境变量：
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `CI_LOG_CLEANUP_ENABLED` | `true` | 是否在 CI 容器启动时清理历史日志 |
+| `CI_LOG_RETENTION_DAYS` | `7` | 仅保留最近多少天的日志 |
+| `CI_LOG_CLEANUP_DIRS` | 空 | 额外清理目录，多个目录用 `:` 分隔 |
+
+默认会清理这些目录中超过保留天数的文件：仓库内 `log/`、`logs/`、`log_ut/`、`output/log*/`、`build/log*/`、`build_out/log*/`，以及容器内常见的 Ascend/NPU 日志目录。
 
 ## 第 11 步：合入前怎么判断是否满足门禁
 
@@ -506,6 +623,16 @@ Custom OPP op_api lib: /usr/local/Ascend/.../opp/vendors/fla_npu_transformer/op_
 - workflow 是否启用
 - Actions 页面是否出现新的 `NPU CI` run
 
+### PR 创建后没有 `NPU CI / 手动验证` 未执行状态
+
+检查：
+
+- `NPU CI 默认状态` workflow 是否启用
+- PR 是否是新建、重开、ready for review，或刚 push 了新 commit
+- workflow 是否有 `statuses: write` 权限
+- 如果默认 `GITHUB_TOKEN` 没有写权限，是否已经配置仓库 secret `NPU_CI_BOT_TOKEN`
+- Actions 页面是否出现新的 `NPU CI 默认状态` run
+
 ### Actions 已触发，但 PR 下没有机器人评论
 
 检查：
@@ -514,6 +641,47 @@ Custom OPP op_api lib: /usr/local/Ascend/.../opp/vendors/fla_npu_transformer/op_
 - 如果仓库不能开启默认写权限，是否已经配置仓库 secret `NPU_CI_BOT_TOKEN`
 - `NPU_CI_BOT_TOKEN` 是否至少具备 PR 读取、issue comment 写入、commit status 写入权限
 - workflow 日志里是否还有 `Resource not accessible by integration`
+
+### 多个 NPU CI 同时触发怎么办
+
+同一 PR 的同一 head commit 如果已经有 NPU CI 在排队或运行，重复评论只会更新机器人评论，不会再启动新任务。
+
+不同 PR 或不同 commit 同时触发时，GitHub Actions 可能把它们分配给不同 self-hosted runner。runner 宿主机会用 `flock` 给物理 NPU 加锁，避免多个任务抢同一张卡。默认锁文件如下：
+
+```text
+/tmp/fla-npu-ci-npu-0.lock
+/tmp/fla-npu-ci-npu-1.lock
+```
+
+如果所有候选 NPU 都被锁住，job 会输出：
+
+```text
+[CI] All detected NPU devices are locked; retrying in 10s.
+```
+
+这不是失败，表示正在等待其他 NPU CI 释放卡。如果等待超过 `CI_NPU_LOCK_WAIT_SECONDS`，job 才会失败。
+
+### CI 容器日志怎么保留
+
+CI 容器启动时会自动执行：
+
+```sh
+bash ci/cleanup_ci_logs.sh
+```
+
+默认只保留 7 天内的日志。需要调整时，在 runner 环境或 workflow 环境变量里设置：
+
+```sh
+export CI_LOG_RETENTION_DAYS=7
+```
+
+如果某次排障需要临时保留所有容器内日志，可以设置：
+
+```sh
+export CI_LOG_CLEANUP_ENABLED=false
+```
+
+注意：GitHub Actions 网页上的 run 日志保留时间由 GitHub 仓库或组织设置控制，不受 `ci/cleanup_ci_logs.sh` 影响。
 
 ## 参考链接
 
