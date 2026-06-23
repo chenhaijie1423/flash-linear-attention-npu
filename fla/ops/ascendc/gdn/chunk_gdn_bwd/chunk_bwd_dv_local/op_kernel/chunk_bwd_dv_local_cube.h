@@ -145,6 +145,10 @@ __aicore__ inline void ChunkBwdDvLocalCube<QKVT, GT, Strategy, V>::Process()
 
     IndexResult indexResult;
     int64_t coreBaseOffset = coreIdx * headBufNum * strategy.chunkSize * strategy.chunkSize;
+    int64_t p1SlotNum = headBufNum / (hRatio + 1);
+    if (p1SlotNum <= 0) {
+        p1SlotNum = NUM_2;
+    }
     for (int64_t loopIdx = coreIdx; loopIdx < coreLoops; loopIdx += blockNum) {
         int64_t curBatchId = static_cast<int64_t>(loopIdx) / strategy.chunkNumForT;
         strategy.calculate(loopIdx, indexResult);
@@ -154,9 +158,40 @@ __aicore__ inline void ChunkBwdDvLocalCube<QKVT, GT, Strategy, V>::Process()
         Catlass::GemmCoord actualBlockShapeV{static_cast<uint32_t>(indexResult.chunkLen),
                                              static_cast<uint32_t>(V),
                                              static_cast<uint32_t>(indexResult.chunkLen)};
-        for (int64_t qkHead = 0; qkHead < H_qk; qkHead++) {
-            int64_t p1Slot = qkHead % 2;
-            {
+        for (int64_t scheduleIdx = 0; scheduleIdx < H_qk + p1SlotNum; scheduleIdx++) {
+            if (scheduleIdx >= p1SlotNum) {
+                int64_t qkHead = scheduleIdx - p1SlotNum;
+                if (qkHead < H_qk) {
+                    for (int64_t doGroup = 0; doGroup < hRatio; doGroup++) {
+                        AscendC::CrossCoreWaitFlag(SYNC_AIV_AIC_FLAG_1);
+                    }
+                    BlockMmadV blockMmadV(resource);
+                    for (int64_t doGroup = 0; doGroup < hRatio; doGroup++) {
+                        int64_t doHead = qkHead * hRatio + doGroup;
+                        int64_t gatedSlot = p1SlotNum + (qkHead % p1SlotNum) * hRatio + doGroup;
+                        auto tensorA_V = tla::MakeTensor(
+                            workspaceGm[coreBaseOffset + gatedSlot * strategy.chunkSize * strategy.chunkSize],
+                            layoutA_V, Catlass::Arch::PositionGM{});
+                        auto tensorB_V =
+                            tla::MakeTensor(dOGm[curBatchId * H_do * T * V + doHead * T * V + indexResult.curTokenId * V],
+                                            layoutB_V, Catlass::Arch::PositionGM{});
+                        auto tensorC_V =
+                            tla::MakeTensor(dVGm[curBatchId * H_do * T * V + doHead * T * V + indexResult.curTokenId * V],
+                                            layoutC_V, Catlass::Arch::PositionGM{});
+                        auto tensorBlockA_V =
+                            GetTile(tensorA_V, tla::MakeCoord(0, 0), tla::MakeShape(actualBlockShapeV.m(), actualBlockShapeV.k()));
+                        auto tensorBlockB_V =
+                            GetTile(tensorB_V, tla::MakeCoord(0, 0), tla::MakeShape(actualBlockShapeV.k(), actualBlockShapeV.n()));
+                        auto tensorBlockC_V =
+                            GetTile(tensorC_V, tla::MakeCoord(0, 0), tla::MakeShape(actualBlockShapeV.m(), actualBlockShapeV.n()));
+                        blockMmadV(tensorBlockA_V, tensorBlockB_V, tensorBlockC_V, actualBlockShapeV);
+                    }
+                }
+            }
+
+            if (scheduleIdx < H_qk) {
+                int64_t qkHead = scheduleIdx;
+                int64_t p1Slot = qkHead % p1SlotNum;
                 BlockMmadQK blockMmadQK(resource);
                 auto tensorA =
                     tla::MakeTensor(kGm[curBatchId * H_qk * T * K + qkHead * T * K + indexResult.curTokenId * K], layoutA_QK,
@@ -174,33 +209,7 @@ __aicore__ inline void ChunkBwdDvLocalCube<QKVT, GT, Strategy, V>::Process()
                 auto tensorBlockC =
                     GetTile(tensorC, tla::MakeCoord(0, 0), tla::MakeShape(actualBlockShapeQK.m(), actualBlockShapeQK.n()));
                 blockMmadQK(tensorBlockA, tensorBlockB, tensorBlockC, actualBlockShapeQK);
-            }
-            AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(SYNC_AIC_AIV_FLAG_3);
-            for (int64_t doGroup = 0; doGroup < hRatio; doGroup++) {
-                AscendC::CrossCoreWaitFlag(SYNC_AIV_AIC_FLAG_1);
-            }
-            {
-                BlockMmadV blockMmadV(resource);
-                for (int64_t doGroup = 0; doGroup < hRatio; doGroup++) {
-                    int64_t doHead = qkHead * hRatio + doGroup;
-                    int64_t gatedSlot = 2 + (qkHead % 2) * hRatio + doGroup;
-                    auto tensorA_V = tla::MakeTensor(
-                        workspaceGm[coreBaseOffset + gatedSlot * strategy.chunkSize * strategy.chunkSize],
-                        layoutA_V, Catlass::Arch::PositionGM{});
-                    auto tensorB_V =
-                        tla::MakeTensor(dOGm[curBatchId * H_do * T * V + doHead * T * V + indexResult.curTokenId * V],
-                                        layoutB_V, Catlass::Arch::PositionGM{});
-                    auto tensorC_V =
-                        tla::MakeTensor(dVGm[curBatchId * H_do * T * V + doHead * T * V + indexResult.curTokenId * V],
-                                        layoutC_V, Catlass::Arch::PositionGM{});
-                    auto tensorBlockA_V =
-                        GetTile(tensorA_V, tla::MakeCoord(0, 0), tla::MakeShape(actualBlockShapeV.m(), actualBlockShapeV.k()));
-                    auto tensorBlockB_V =
-                        GetTile(tensorB_V, tla::MakeCoord(0, 0), tla::MakeShape(actualBlockShapeV.k(), actualBlockShapeV.n()));
-                    auto tensorBlockC_V =
-                        GetTile(tensorC_V, tla::MakeCoord(0, 0), tla::MakeShape(actualBlockShapeV.m(), actualBlockShapeV.n()));
-                    blockMmadV(tensorBlockA_V, tensorBlockB_V, tensorBlockC_V, actualBlockShapeV);
-                }
+                AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(SYNC_AIC_AIV_FLAG_3);
             }
         }
     }

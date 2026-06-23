@@ -54,6 +54,7 @@ static constexpr int64_t CHUNK_INDICES_DIM_1_SIZE = 2;
 static constexpr int64_t K_SIZE_128 = 128;
 static constexpr int64_t V_SIZE_128 = 128;
 static constexpr int64_t V_SIZE_256 = 256;
+static constexpr int64_t P1_SLOT_NUM = 3;
 
 static constexpr const char *const INPUT_Q_NAME = "q";
 static constexpr const char *const INPUT_K_NAME = "k";
@@ -184,7 +185,7 @@ public:
                             tiling_.hDo, tiling_.hQk),
                     return ge::GRAPH_FAILED);
         tiling_.hRatio = tiling_.hDo / tiling_.hQk;
-        tiling_.headBufNum = 2 + 2 * tiling_.hRatio;
+        tiling_.headBufNum = P1_SLOT_NUM * (1 + tiling_.hRatio);
         tiling_.t = static_cast<int64_t>(qStorageShape.GetDim(DIM_2));
         tiling_.k = static_cast<int64_t>(qStorageShape.GetDim(DIM_3));
         tiling_.v = static_cast<int64_t>(dOStorageShape.GetDim(DIM_3));
@@ -258,7 +259,7 @@ public:
         OP_CHECK_IF(CommonTiling() != ge::GRAPH_SUCCESS, , return ge::GRAPH_FAILED);
         if (IsVariableLength()) {
             OP_CHECK_IF(tiling_.b != V_L_B,
-                        OP_LOGE(ctx_.nodeName, "B cannot be 1 when cu_seqlens is nullptr."),
+                        OP_LOGE(ctx_.nodeName, "B must be 1 when cu_seqlens is not nullptr."),
                         return ge::GRAPH_FAILED);
             OP_CHECK_IF(VariableLenTiling() != ge::GRAPH_SUCCESS, , return ge::GRAPH_FAILED);
         } else {

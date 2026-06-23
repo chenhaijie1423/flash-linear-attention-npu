@@ -98,7 +98,6 @@ TilingData calc_tiling_params(const at::Tensor &q, const at::Tensor &k, const at
 }
 
 template <typename QKVT, typename GT, int V>
-template <typename QKVT, typename GT, int V>
 __global__ __aicore__ void chunk_bwd_dv_local_kernel(
     GM_ADDR q, GM_ADDR k, GM_ADDR d_o, GM_ADDR g,
     GM_ADDR cu_seqlens, GM_ADDR chunk_indices,

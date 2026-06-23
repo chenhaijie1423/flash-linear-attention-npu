@@ -172,12 +172,16 @@ __aicore__ inline void ChunkBwdDvLocalVector<QKVT, GT, Strategy>::ProcessChunk(c
     AscendC::LocalTensor<float> kqFp32LocalTensor = kqFp32TBuf.template Get<float>();
 
     int64_t coreBaseOffset = coreIdx * headBufNum * strategy.chunkSize * strategy.chunkSize;
+    int64_t p1SlotNum = headBufNum / (hRatio + 1);
+    if (p1SlotNum <= 0) {
+        p1SlotNum = NUM_2;
+    }
     AscendC::PipeBarrier<PIPE_V>();
     for (int64_t doHead = 0; doHead < H_do; doHead++) {
         int64_t qkHead = doHead / hRatio;
         int64_t doGroup = doHead % hRatio;
-        int64_t p1Slot = qkHead % 2;
-        int64_t gatedSlot = 2 + (qkHead % 2) * hRatio + doGroup;
+        int64_t p1Slot = qkHead % p1SlotNum;
+        int64_t gatedSlot = p1SlotNum + (qkHead % p1SlotNum) * hRatio + doGroup;
         int64_t baseReadOffset = coreBaseOffset + p1Slot * strategy.chunkSize * strategy.chunkSize;
         int64_t baseWriteOffset = coreBaseOffset + gatedSlot * strategy.chunkSize * strategy.chunkSize;
         ++vecTaskIdx;
