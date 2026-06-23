@@ -658,7 +658,7 @@ public:
         ptrDq(dq), ptrDk(dk), ptrDw(dw), ptrDg(dg),
         ptrWorkspace(workspace) {}
     
-    __aicore__ inline void Init(const ChunkBwdDqkwgTilingData &tiling);
+    __aicore__ inline void Init(const GDN::ChunkBwdDqkwgTilingData &tiling);
     __aicore__ inline void Process();
     
 private:
@@ -702,7 +702,7 @@ private:
 };
 
 template <typename DataType, typename GType>
-__aicore__ inline void ChunkBwdDqkwgCubeProcess<DataType, GType>::Init(const ChunkBwdDqkwgTilingData &tiling) {
+__aicore__ inline void ChunkBwdDqkwgCubeProcess<DataType, GType>::Init(const GDN::ChunkBwdDqkwgTilingData &tiling) {
 
 /*
     // 设置 workspace 偏移

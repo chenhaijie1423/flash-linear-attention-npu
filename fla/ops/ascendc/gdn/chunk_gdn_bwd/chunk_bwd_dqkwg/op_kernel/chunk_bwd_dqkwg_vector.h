@@ -29,7 +29,7 @@ public:
         GM_ADDR workspace
     );
     
-    __aicore__ inline void Init(const ChunkBwdDqkwgTilingData &tiling, TPipe *pipe_);
+    __aicore__ inline void Init(const GDN::ChunkBwdDqkwgTilingData &tiling, TPipe *pipe_);
     __aicore__ inline void Process();
     
 private:
@@ -141,7 +141,7 @@ __aicore__ inline ChunkBwdDqkwgVectorProcess<DataType, GType>::ChunkBwdDqkwgVect
 
 // ============== 初始化 ==============
 template <typename DataType, typename GType>
-__aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::Init(const ChunkBwdDqkwgTilingData &tiling, TPipe *pipe_) {
+__aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::Init(const GDN::ChunkBwdDqkwgTilingData &tiling, TPipe *pipe_) {
     pipe = pipe_;
 
     scale = tiling.scale;
