@@ -47,9 +47,10 @@
              .ExtendCfgInfo("opFile.value", "solve_tri")
              .ExtendCfgInfo("aclnnSupport.value", "support_aclnn");
  
-         this->AICore().AddConfig("ascend910b", aicore_config);
-     }
- };
+        this->AICore().AddConfig("ascend910b", aicore_config);
+        this->AICore().AddConfig("ascend910_93", aicore_config);
+    }
+};
  OP_ADD(SolveTri);
  }  // namespace ops
  
