@@ -19,8 +19,8 @@
 
 namespace GDN {
 
-constexpr uint32_t CHUNK_GATED_DELTA_RULE_BWD_DHU_TILING_KEY = 0;
-constexpr uint32_t CHUNK_GATED_DELTA_RULE_BWD_DHU_TILING_KEY_G_FP32 = 1;
+constexpr uint32_t CHUNK_GATED_DELTA_RULE_BWD_DHU_TILING_KEY = 1;
+constexpr uint32_t CHUNK_GATED_DELTA_RULE_BWD_DHU_TILING_KEY_G_FP32 = 2;
 
 struct ChunkGatedDeltaRuleBwdDhuTilingData {
     uint64_t B;

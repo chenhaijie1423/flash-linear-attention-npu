@@ -59,7 +59,6 @@ extern "C" __global__ __aicore__ void chunk_gated_delta_rule_bwd_dhu(
     (void)gk;
     (void)h0;
     (void)dht;
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     GM_ADDR userWS = AscendC::GetUserWorkspace(workspace);
     if (userWS == nullptr) {
         return;
@@ -68,11 +67,12 @@ extern "C" __global__ __aicore__ void chunk_gated_delta_rule_bwd_dhu(
     REGISTER_TILING_DEFAULT(GDN::ChunkGatedDeltaRuleBwdDhuTilingData);
     GET_TILING_DATA_WITH_STRUCT(GDN::ChunkGatedDeltaRuleBwdDhuTilingData, tilingData, tiling);
 
-    if (TILING_KEY_IS(GDN::CHUNK_GATED_DELTA_RULE_BWD_DHU_TILING_KEY)) {
+    if (TILING_KEY_IS(1)) {
+        KERNEL_TASK_TYPE(1, KERNEL_TYPE_MIX_AIC_1_2);
         GDN::ChunkGatedDeltaRuleBwdDhuKernelImpl<DTYPE_Q, DTYPE_Q>(
             q, k, w, d_o, dv, g, cu_seqlens, chunk_indices, dh, dh0, dv2, userWS, &tilingData);
-    }
-    if (TILING_KEY_IS(GDN::CHUNK_GATED_DELTA_RULE_BWD_DHU_TILING_KEY_G_FP32)) {
+    } else if (TILING_KEY_IS(2)) {
+        KERNEL_TASK_TYPE(2, KERNEL_TYPE_MIX_AIC_1_2);
         GDN::ChunkGatedDeltaRuleBwdDhuKernelImpl<DTYPE_Q, float>(
             q, k, w, d_o, dv, g, cu_seqlens, chunk_indices, dh, dh0, dv2, userWS, &tilingData);
     }

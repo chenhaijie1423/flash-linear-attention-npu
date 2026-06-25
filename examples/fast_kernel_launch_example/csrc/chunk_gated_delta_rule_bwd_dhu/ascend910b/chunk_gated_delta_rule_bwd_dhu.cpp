@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <tuple>
+#include <type_traits>
 #include <vector>
 #include <ATen/Operators.h>
 #include <torch/all.h>
@@ -78,7 +79,6 @@ struct ChunkGatedDeltaRuleBwdDhuTilingResult {
     TilingData tiling;
     uint32_t blockDim;
     size_t workspaceSize;
-    uint32_t tilingKey;
 };
 
 void CheckInputRank(const at::Tensor &tensor, int64_t rank, const char *name)
@@ -227,8 +227,7 @@ ChunkGatedDeltaRuleBwdDhuTilingResult CalcTilingParams(
 
     optiling::ChunkGatedDeltaRuleBwdDhuTilingProcessor processor(ctx, tiling);
     TORCH_CHECK(processor.Process() == ge::GRAPH_SUCCESS, "chunk_gated_delta_rule_bwd_dhu tiling failed.");
-    return ChunkGatedDeltaRuleBwdDhuTilingResult{tiling, processor.GetBlockDim(), processor.GetWorkspaceSize(),
-                                                 processor.GetTilingKey()};
+    return ChunkGatedDeltaRuleBwdDhuTilingResult{tiling, processor.GetBlockDim(), processor.GetWorkspaceSize()};
 }
 
 template <typename DT, typename GT>
@@ -240,12 +239,17 @@ __global__ __aicore__ void chunk_gated_delta_rule_bwd_dhu_kernel(
     (void)gk;
     (void)h0;
     (void)dht;
+    AscendC::AscendCUtils::SetOverflow(1);
     AscendC::SetSysWorkspaceForce(workspace);
     GM_ADDR userWS = AscendC::GetUserWorkspace(workspace);
     if (userWS == nullptr) {
         return;
     }
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    if constexpr (std::is_same_v<GT, float>) {
+        KERNEL_TASK_TYPE(2, KERNEL_TYPE_MIX_AIC_1_2);
+    } else {
+        KERNEL_TASK_TYPE(1, KERNEL_TYPE_MIX_AIC_1_2);
+    }
     GDN::ChunkGatedDeltaRuleBwdDhuKernelImpl<DT, GT>(
         q, k, w, d_o, dv, g, cu_seqlens, chunk_indices, dh, dh0, dv2, userWS, &tilingData);
 }
@@ -348,8 +352,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> chunk_gated_delta_rule_bwd_dhu_np
     };
 
     at_npu::native::OpCommand::RunOpApi("ChunkGatedDeltaRuleBwdDhu", aclCall);
-    auto syncRet = aclrtSynchronizeStream(stream);
-    TORCH_CHECK(syncRet == ACL_SUCCESS, "aclrtSynchronizeStream failed. ERROR: ", syncRet);
 
     if (workspacePtr != nullptr) {
         aclrtFree(workspacePtr);
