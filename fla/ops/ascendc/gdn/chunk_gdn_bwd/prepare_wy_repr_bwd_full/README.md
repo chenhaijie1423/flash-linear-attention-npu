@@ -1,5 +1,5 @@
 # PrepareWyReprBwdFull 算子说明
-`PrepareWyReprBwdFull` 是一个用于分块门控 delta 规则（Chunk Gated Delta Rule）中 WY 表示（WY Representation）反向传播过程的自定义算子。该算子根据前向保存的中间矩阵、权重及上游梯度，计算并输出针对 Key（k）、Value（v）、Beta（β）和 Gate（g）的梯度。
+`PrepareWyReprBwdFull` 是一个用于分块门控 delta 规则（Chunk Gated Delta Rule）中 WY 表示（WY Representation）反向传播过程的自定义算子。该算子根据前向保存的中间矩阵、权重及上游梯度，计算并输出针对 Key（k）、Value（v）、Beta（β）和 Gate（g）的梯度，并支持 Key head 数（`HK`）与 Value head 数（`HV`）分离的 GVA 形态。
 
 ---
 
@@ -56,14 +56,14 @@ aclnnStatus aclnnPrepareWyReprBwdFull(
 
 | 参数名 | 输入/输出 | 必选/可选 | 描述 | 使用说明 | 数据类型 | 数据格式 | 维度（Shape） | 非连续 Tensor |
 |---|---|---|---|---|---|---|---|---|
-| `k` | 输入 | 必选 | Key 输入张量 | 参与反向计算 | `FLOAT16`、`BFLOAT16` | `ND` | `[B, H, T, K]` | 支持 |
-| `v` | 输入 | 必选 | Value 输入张量 | 参与反向计算 | `FLOAT16`、`BFLOAT16` | `ND` | `[B, H, T, V]` | 支持 |
-| `beta` | 输入 | 必选 | Beta 缩放参数张量 | 三维 Beta 参数 | `FLOAT16`、`BFLOAT16`、`FLOAT` | `ND` | `[B, H, T]` | 支持 |
-| `a` | 输入 | 必选 | 前向保存的块内因果注意力矩阵 A | 每个 chunk 内的下三角因果矩阵，最后一维为 `chunkSize` | `FLOAT16`、`BFLOAT16` | `ND` | `[B, H, T, chunkSize]` | 支持 |
-| `dA` | 输入 | 必选 | 矩阵 A 的上游梯度 | 与 `a` 形状相同 | `FLOAT16`、`BFLOAT16` | `ND` | `[B, H, T, chunkSize]` | 支持 |
-| `dw` | 输入 | 必选 | Weight w 的上游梯度 | 形状与 `k` 相同 | `FLOAT16`、`BFLOAT16` | `ND` | `[B, H, T, K]` | 支持 |
-| `du` | 输入 | 必选 | 更新量 u 的上游梯度 | 形状与 `v` 相同 | `FLOAT16`、`BFLOAT16` | `ND` | `[B, H, T, V]` | 支持 |
-| `g` | 输入 | 必选 | Gate 输入张量 | 三维 Gate 参数 | `FLOAT16`、`BFLOAT16`、`FLOAT` | `ND` | `[B, H, T]` | 支持 |
+| `k` | 输入 | 必选 | Key 输入张量 | 参与反向计算 | `FLOAT16`、`BFLOAT16` | `ND` | `[B, HK, T, K]` | 支持 |
+| `v` | 输入 | 必选 | Value 输入张量 | 参与反向计算 | `FLOAT16`、`BFLOAT16` | `ND` | `[B, HV, T, V]` | 支持 |
+| `beta` | 输入 | 必选 | Beta 缩放参数张量 | 三维 Beta 参数 | `FLOAT16`、`BFLOAT16`、`FLOAT` | `ND` | `[B, HV, T]` | 支持 |
+| `a` | 输入 | 必选 | 前向保存的块内因果注意力矩阵 A | 每个 chunk 内的下三角因果矩阵，最后一维为 `chunkSize` | `FLOAT16`、`BFLOAT16` | `ND` | `[B, HV, T, chunkSize]` | 支持 |
+| `dA` | 输入 | 必选 | 矩阵 A 的上游梯度 | 与 `a` 形状相同 | `FLOAT16`、`BFLOAT16` | `ND` | `[B, HV, T, chunkSize]` | 支持 |
+| `dw` | 输入 | 必选 | Weight w 的上游梯度 | 形状与 `k` 相同 | `FLOAT16`、`BFLOAT16` | `ND` | `[B, HK, T, K]` | 支持 |
+| `du` | 输入 | 必选 | 更新量 u 的上游梯度 | 形状与 `v` 相同 | `FLOAT16`、`BFLOAT16` | `ND` | `[B, HV, T, V]` | 支持 |
+| `g` | 输入 | 必选 | Gate 输入张量 | 三维 Gate 参数 | `FLOAT16`、`BFLOAT16`、`FLOAT` | `ND` | `[B, HV, T]` | 支持 |
 | `cuSeqlensOptional` | 输入 | 可选 | 变长序列的累计长度信息 | 变长模式输入，形状为 `[N+1]`，首元素须为 `0` | `INT64` | `ND` | 1 维 | - |
 | `chunkIndicesOptional` | 输入 | 可选 | 分块索引信息 | 变长模式输入，扁平化存储 `[seqIdx0, chunkIdx0, seqIdx1, chunkIdx1, ...]`，长度为 `2 * numChunks` | `INT64` | `ND` | 1 维 | - |
 
@@ -77,24 +77,27 @@ aclnnStatus aclnnPrepareWyReprBwdFull(
 
 | 参数名 | 输入/输出 | 描述 | 数据类型 | 数据格式 | 维度（Shape） | 非连续 Tensor |
 |---|---|---|---|---|---|---|
-| `dkOut` | 输出 | Key 梯度输出张量 | `FLOAT16`、`BFLOAT16` | `ND` | `[B, H, T, K]` | 支持 |
-| `dvOut` | 输出 | Value 梯度输出张量 | `FLOAT16`、`BFLOAT16` | `ND` | `[B, H, T, V]` | 支持 |
-| `dbetaOut` | 输出 | Beta 梯度输出张量 | `FLOAT16`、`BFLOAT16`、`FLOAT` | `ND` | `[B, H, T]` | 支持 |
-| `dgOut` | 输出 | Gate 梯度输出张量 | `FLOAT16`、`BFLOAT16`、`FLOAT` | `ND` | `[B, H, T]` | 支持 |
+| `dkOut` | 输出 | Key 梯度输出张量 | `FLOAT16`、`BFLOAT16` | `ND` | `[B, HK, T, K]` | 支持 |
+| `dvOut` | 输出 | Value 梯度输出张量 | `FLOAT16`、`BFLOAT16` | `ND` | `[B, HV, T, V]` | 支持 |
+| `dbetaOut` | 输出 | Beta 梯度输出张量 | `FLOAT16`、`BFLOAT16`、`FLOAT` | `ND` | `[B, HV, T]` | 支持 |
+| `dgOut` | 输出 | Gate 梯度输出张量 | `FLOAT16`、`BFLOAT16`、`FLOAT` | `ND` | `[B, HV, T]` | 支持 |
 | `workspaceSize` | 输出 | Device 侧所需 workspace 大小 | `uint64_t` | - | 标量 | - |
 | `executor` | 输出 | 算子执行器，封装了计算流程 | `aclOpExecutor*` | - | - | - |
 
 ### 3.4 形状与约束
 
-- `k`、`dw` 的形状必须为 `[B, H, T, K]`。
-- `v`、`du` 的形状必须为 `[B, H, T, V]`。
-- `beta`、`g` 的形状必须为 `[B, H, T]`。
-- `a`、`dA` 的形状必须为 `[B, H, T, chunkSize]`。
-- `v` 与 `k` 的前三维（B、H、T）必须一致。
+- `k`、`dw` 的形状必须为 `[B, HK, T, K]`。
+- `v`、`du` 的形状必须为 `[B, HV, T, V]`。
+- `beta`、`g` 的形状必须为 `[B, HV, T]`。
+- `a`、`dA` 的形状必须为 `[B, HV, T, chunkSize]`。
+- `v` 与 `k` 的 batch 维（`B`）和 time 维（`T`）必须一致。
+- `HK` 与 `HV` 均须为正数，且 `HV` 必须是 `HK` 的整数倍。
 - `v` 与 `du` 的全部四维必须一致。
 - `k` 与 `dw` 的全部四维必须一致。
 - `a` 与 `dA` 的全部四维必须一致。
-- `beta`、`g`、`k` 的前三维（B、H、T）必须一致。
+- `beta` 与 `g` 的全部三维必须一致，且二者的 `[B, HV, T]` 必须与 `v` 对齐。
+- `a` 与 `dA` 的 `[B, HV, T]` 必须与 `v` 对齐。
+- `V` 当前仅支持 `128` 或 `256`。
 - `chunkSize` 当前仅支持 `64` 或 `128`。
 - 当启用变长模式时，`cuSeqlensOptional` 和 `chunkIndicesOptional` 须同时提供，且仅支持 `B = 1`。
 
@@ -118,13 +121,15 @@ aclnnStatus aclnnPrepareWyReprBwdFull(
 
 必须满足以下条件：
 
-- `k, dw`: `[B, H, T, K]`
-- `v, du`: `[B, H, T, V]`
-- `beta, g`: `[B, H, T]`
-- `a, dA`: `[B, H, T, chunkSize]`
+- `k, dw`: `[B, HK, T, K]`
+- `v, du`: `[B, HV, T, V]`
+- `beta, g`: `[B, HV, T]`
+- `a, dA`: `[B, HV, T, chunkSize]`
 
 额外限制：
 
+- `HK > 0`，`HV > 0`，且 `HV % HK == 0`
+- `V ∈ {128, 256}`
 - `chunkSize ∈ {64, 128}`
 
 ---
@@ -146,7 +151,7 @@ B = 1
 
 ### 4.4 数值语义
 
-算子在每个 chunk 内执行以下反向传播计算（以伪代码表示）：
+算子在每个 chunk 内执行以下反向传播计算（以伪代码表示）。当 `HK` 与 `HV` 不相等时，Value head `h_v` 对应的 Key head 为 `h_k = h_v // (HV / HK)`，`k`、`dw`、`dk` 使用 `HK` 维，其余张量使用 `HV` 维。
 
 **dv**（Value 的梯度）：
 ```text
@@ -186,21 +191,21 @@ import torch_npu
 
 def test_prepare_wy_repr_bwd_full_fix():
     # 参数设置
-    B, H, T, K, V = 1, 8, 512, 128, 128
+    B, HK, HV, T, K, V = 1, 16, 32, 512, 128, 256
     chunk_size = 64
     device = "npu:0"
     ktype = torch.float16
     btype = torch.float16
 
     # 构造输入
-    k    = torch.rand(B, H, T, K,          dtype=ktype).to(device)
-    v    = torch.rand(B, H, T, V,          dtype=ktype).to(device)
-    beta = torch.rand(B, H, T,             dtype=btype).to(device)
-    A    = torch.rand(B, H, T, chunk_size, dtype=ktype).to(device)
-    dA   = torch.rand(B, H, T, chunk_size, dtype=ktype).to(device)
-    dw   = torch.rand(B, H, T, K,          dtype=ktype).to(device)
-    du   = torch.rand(B, H, T, V,          dtype=ktype).to(device)
-    g    = torch.rand(B, H, T,             dtype=btype).to(device)
+    k    = torch.rand(B, HK, T, K,          dtype=ktype).to(device)
+    v    = torch.rand(B, HV, T, V,          dtype=ktype).to(device)
+    beta = torch.rand(B, HV, T,             dtype=btype).to(device)
+    A    = torch.rand(B, HV, T, chunk_size, dtype=ktype).to(device)
+    dA   = torch.rand(B, HV, T, chunk_size, dtype=ktype).to(device)
+    dw   = torch.rand(B, HK, T, K,          dtype=ktype).to(device)
+    du   = torch.rand(B, HV, T, V,          dtype=ktype).to(device)
+    g    = torch.rand(B, HV, T,             dtype=btype).to(device)
 
     # 调用算子（固定长度模式）
     dk, dv, dbeta, dg = torch_npu.npu_prepare_wy_repr_bwd_full(
@@ -214,10 +219,10 @@ def test_prepare_wy_repr_bwd_full_fix():
     print("dv    shape:", dv.shape)
     print("dbeta shape:", dbeta.shape)
     print("dg    shape:", dg.shape)
-    assert dk.shape    == (B, H, T, K)
-    assert dv.shape    == (B, H, T, V)
-    assert dbeta.shape == (B, H, T)
-    assert dg.shape    == (B, H, T)
+    assert dk.shape    == (B, HK, T, K)
+    assert dv.shape    == (B, HV, T, V)
+    assert dbeta.shape == (B, HV, T)
+    assert dg.shape    == (B, HV, T)
     print("Fix-length Execution Successful!")
 
 if __name__ == "__main__":
@@ -254,7 +259,7 @@ def prepare_chunk_indices(cu_seqlens, chunk_size: int):
 
 def test_prepare_wy_repr_bwd_full_varlen():
     # 参数设置（变长模式要求 B = 1）
-    B, H, T, K, V = 1, 8, 512, 128, 128
+    B, HK, HV, T, K, V = 1, 16, 32, 512, 128, 256
     chunk_size = 64
     device = "npu:0"
     ktype = torch.float16
@@ -265,14 +270,14 @@ def test_prepare_wy_repr_bwd_full_varlen():
     chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
 
     # 构造输入
-    k    = torch.rand(B, H, T, K,          dtype=ktype).to(device)
-    v    = torch.rand(B, H, T, V,          dtype=ktype).to(device)
-    beta = torch.rand(B, H, T,             dtype=btype).to(device)
-    A    = torch.rand(B, H, T, chunk_size, dtype=ktype).to(device)
-    dA   = torch.rand(B, H, T, chunk_size, dtype=ktype).to(device)
-    dw   = torch.rand(B, H, T, K,          dtype=ktype).to(device)
-    du   = torch.rand(B, H, T, V,          dtype=ktype).to(device)
-    g    = torch.rand(B, H, T,             dtype=btype).to(device)
+    k    = torch.rand(B, HK, T, K,          dtype=ktype).to(device)
+    v    = torch.rand(B, HV, T, V,          dtype=ktype).to(device)
+    beta = torch.rand(B, HV, T,             dtype=btype).to(device)
+    A    = torch.rand(B, HV, T, chunk_size, dtype=ktype).to(device)
+    dA   = torch.rand(B, HV, T, chunk_size, dtype=ktype).to(device)
+    dw   = torch.rand(B, HK, T, K,          dtype=ktype).to(device)
+    du   = torch.rand(B, HV, T, V,          dtype=ktype).to(device)
+    g    = torch.rand(B, HV, T,             dtype=btype).to(device)
 
     # 调用算子（变长模式）
     dk, dv, dbeta, dg = torch_npu.npu_prepare_wy_repr_bwd_full(
@@ -286,10 +291,10 @@ def test_prepare_wy_repr_bwd_full_varlen():
     print("dv    shape:", dv.shape)
     print("dbeta shape:", dbeta.shape)
     print("dg    shape:", dg.shape)
-    assert dk.shape    == (B, H, T, K)
-    assert dv.shape    == (B, H, T, V)
-    assert dbeta.shape == (B, H, T)
-    assert dg.shape    == (B, H, T)
+    assert dk.shape    == (B, HK, T, K)
+    assert dv.shape    == (B, HV, T, V)
+    assert dbeta.shape == (B, HV, T)
+    assert dg.shape    == (B, HV, T)
     print("Variable-length Execution Successful!")
 
 if __name__ == "__main__":
