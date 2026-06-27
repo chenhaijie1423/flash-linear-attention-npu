@@ -35,12 +35,12 @@ namespace Catlass::Gemm::Block {
 
 
 struct GDNFwdOOffsets {
-    uint32_t qkOffset;
-    uint32_t ovOffset;
-    uint32_t hOffset;
-    uint32_t gOffset;
-    uint32_t attnWorkOffset;
-    uint32_t hvWorkOffset;
+    int64_t qkOffset;
+    int64_t ovOffset;
+    int64_t hOffset;
+    int64_t gOffset;
+    int64_t attnWorkOffset;
+    int64_t hvWorkOffset;
     uint32_t vBlockOffset;
     uint32_t vBlockDim;
     bool isFinalState;
@@ -165,12 +165,22 @@ struct BlockSchedulerGdnFwdO {
         batchTokens = isVariedLen ? (gmSeqlen.GetValue(tokenBatchIdx + 1) - tokenOffset) : seqlen;
         uint32_t vBlockOffset = 0;
         uint32_t vBlockDim = vBlockSize;
-        offsets[currStage].qkOffset = (shapeBatchIdx * kNumHead * seqlen + kHeadIdx * seqlen + tokenOffset + batchChunkIdx * chunkSize) * kHeadDim;
-        offsets[currStage].ovOffset = (shapeBatchIdx * vNumHead * seqlen + vHeadIdx * seqlen + tokenOffset + batchChunkIdx * chunkSize) * vHeadDim + vBlockOffset;
-        offsets[currStage].hOffset = (shapeBatchIdx * vNumHead * numChunks + vHeadIdx * numChunks + chunkIdx) * kHeadDim * vHeadDim + vBlockOffset;
-        offsets[currStage].gOffset = shapeBatchIdx * vNumHead * seqlen + vHeadIdx * seqlen + tokenOffset + batchChunkIdx * chunkSize;
-        offsets[currStage].attnWorkOffset = (cubeCoreIdx * PING_PONG_STAGES + currStage) * chunkSize * chunkSize;
-        offsets[currStage].hvWorkOffset = (cubeCoreIdx * PING_PONG_STAGES + currStage) * chunkSize * vBlockSize;
+        const int64_t tokenStart = static_cast<int64_t>(tokenOffset) +
+                                   static_cast<int64_t>(batchChunkIdx) * chunkSize;
+        const int64_t qkRowOffset = (static_cast<int64_t>(shapeBatchIdx) * kNumHead + kHeadIdx) * seqlen +
+                                    tokenStart;
+        const int64_t ovRowOffset = (static_cast<int64_t>(shapeBatchIdx) * vNumHead + vHeadIdx) * seqlen +
+                                    tokenStart;
+        const int64_t hBlockOffset = (static_cast<int64_t>(shapeBatchIdx) * vNumHead * numChunks +
+                                      static_cast<int64_t>(vHeadIdx) * numChunks + chunkIdx) *
+                                     kHeadDim;
+        const int64_t workStageOffset = static_cast<int64_t>(cubeCoreIdx) * PING_PONG_STAGES + currStage;
+        offsets[currStage].qkOffset = qkRowOffset * kHeadDim;
+        offsets[currStage].ovOffset = ovRowOffset * vHeadDim + vBlockOffset;
+        offsets[currStage].hOffset = hBlockOffset * vHeadDim + vBlockOffset;
+        offsets[currStage].gOffset = ovRowOffset;
+        offsets[currStage].attnWorkOffset = workStageOffset * chunkSize * chunkSize;
+        offsets[currStage].hvWorkOffset = workStageOffset * chunkSize * vBlockSize;
         offsets[currStage].vBlockOffset = vBlockOffset;
         offsets[currStage].vBlockDim = vBlockDim;
         offsets[currStage].isFinalState = chunkIdx == (numChunks - 1) || (isVariedLen && gmChunkOffsets.GetValue(2 * chunkIdx + 3) == 0);

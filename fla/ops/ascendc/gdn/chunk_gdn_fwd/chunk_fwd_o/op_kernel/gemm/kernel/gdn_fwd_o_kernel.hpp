@@ -175,11 +175,11 @@ public:
     uint32_t numChunks;
     uint32_t isVariedLen;
     uint32_t tokenBatch;
-    uint32_t vWorkspaceOffset;
-    uint32_t hWorkspaceOffset;
-    uint32_t attnWorkspaceOffset;
-    uint32_t aftermaskWorkspaceOffset;
-    uint32_t maskWorkspaceOffset;
+    int64_t vWorkspaceOffset;
+    int64_t hWorkspaceOffset;
+    int64_t attnWorkspaceOffset;
+    int64_t aftermaskWorkspaceOffset;
+    int64_t maskWorkspaceOffset;
 
     AscendC::GlobalTensor<ElementQ> gmQ;
     AscendC::GlobalTensor<ElementK> gmK;
