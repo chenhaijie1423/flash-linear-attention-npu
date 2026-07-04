@@ -28,7 +28,7 @@ TORCH_EXTENSION_DIR = REPO_ROOT / "torch_custom" / "fla_npu"
 FLA_NPU_PACKAGE_DIR = TORCH_EXTENSION_DIR / "fla_npu"
 
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
-from fla_npu_artifacts import get_package_version  # noqa: E402
+from fla_npu_artifacts import get_package_version, get_wheel_build_tag  # noqa: E402
 
 
 DEFAULT_SOC = "ascend910b"
@@ -516,10 +516,10 @@ class FlaNpuBuildPy(_build_py):
 
 class BinaryDistribution(Distribution):
     def is_pure(self):
-        return False
+        return True
 
     def has_ext_modules(self):
-        return True
+        return False
 
 
 CMDCLASS = {"build_py": FlaNpuBuildPy}
@@ -528,7 +528,10 @@ if _bdist_wheel is not None:
     class FlaNpuBdistWheel(_bdist_wheel):
         def finalize_options(self):
             super().finalize_options()
-            self.root_is_pure = False
+            self.root_is_pure = True
+            build_tag = get_wheel_build_tag(REPO_ROOT)
+            if build_tag:
+                self.build_number = build_tag
 
     CMDCLASS["bdist_wheel"] = FlaNpuBdistWheel
 
