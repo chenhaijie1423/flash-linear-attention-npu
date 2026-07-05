@@ -19,13 +19,17 @@ ASCENDC_NAMES = (
     "prepare_wy_repr_bwd_da",
     "prepare_wy_repr_bwd_full",
     "recompute_w_u_fwd",
+    "solve_tri",
 )
 
 TRITON_NAMES = (
+    "autocast_custom_bwd",
+    "autocast_custom_fwd",
     "causal_conv1d",
     "causal_conv1d_triton",
     "chunk_local_cumsum",
     "chunk_scaled_dot_kkt_fwd",
+    "input_guard",
     "l2norm",
     "solve_tril",
 )

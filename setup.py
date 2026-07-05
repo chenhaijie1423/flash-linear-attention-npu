@@ -36,6 +36,7 @@ DEFAULT_VENDOR_NAME = "fla_npu"
 MIN_PYTHON = (3, 9)
 MIN_TORCH = "2.7.0"
 MIN_TRITON_ASCEND = "3.2.0"
+MIN_TRITON_ASCEND_A5 = "3.2.1"
 TORCH_NPU_GDN_FIX_MINIMUMS = {
     "2.7.1": "2.7.1.post5",
     "2.8.0": "2.8.0.post5",
@@ -146,6 +147,18 @@ def _check_torch_npu_gdn_fix(failures, actual):
     )
 
 
+def _check_triton_ascend_a5_compat(failures, actual):
+    soc = os.getenv("FLA_NPU_SOC", DEFAULT_SOC)
+    if soc != "ascend950":
+        return
+    actual_version = _version_obj(actual)
+    if actual_version is None or actual_version < Version(MIN_TRITON_ASCEND_A5):
+        failures.append(
+            f"triton-ascend>={MIN_TRITON_ASCEND_A5} is required for FLA_NPU_SOC={soc}; got {actual}. "
+            "triton-ascend 3.2.0 can crash on the A5 Triton runtime."
+        )
+
+
 def _distribution_version(name):
     try:
         return importlib_metadata.version(name)
@@ -239,6 +252,7 @@ def _check_build_environment():
     if triton_ascend_version:
         print(f"[fla-npu build][OK] triton-ascend: {triton_ascend_version}")
         _check_min_version(failures, "triton-ascend", triton_ascend_version, MIN_TRITON_ASCEND)
+        _check_triton_ascend_a5_compat(failures, triton_ascend_version)
     else:
         failures.append("triton-ascend distribution was not found")
 
