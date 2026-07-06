@@ -1,14 +1,11 @@
 """
 test_npu_solve_tri_ascend950.py - Test SolveTri custom operator on ascend950 via torch.ops.npu
 
-由仓1 test_npu_solve_tril.py 适配而来。仓2 算子接口：
-    npu_solve_tri(x, *, cu_seqlens=None, chunk_indices=None, layout="bsnd")
-  —— 无 chunk_size 入参，chunk_size 由 x 末维 BT 隐式确定；每个 chunk 块为 BT×BT。
 支持 BSND [B,T,H,BT] 与 TND [total_T,H,BT]（变长）两种布局。
 
 用例覆盖：
-  - 仓1 原有全部用例（BSND + TND varlen，BT=32）。
-  - chunk_size ∈ {16,32,64,128} × 定长(BSND)/变长(TND) × 有尾块/无尾块。
+  - 泛化用例（BSND + TND）。
+  - 组合用例（chunk_size ∈ {16,32,64,128} × 定长(BSND)/变长(TND) × 有尾块/无尾块）。
   - 上述每条用例分别以 fp16 与 bf16 输入各跑一遍（bf16 判据阈值放宽，见 tol_for）。
 """
 import os
@@ -263,15 +260,14 @@ def run_all_cases(dtype):
     print(f"{'#' * 60}")
 
     # ================================================================
-    # Group 1: 仓1 原有全部用例（BT=32）
+    # Group 1: 泛化用例（BSND + TND）
     # ================================================================
-    print("\n########## [Group 1] repo1 original cases (BT=32) ##########")
+    print("\n########## [Group 1] generalized cases (bsnd + varlen) ##########")
     print("\n--- BSND layout [B, T, H, BT] ---")
     results.append(test_solve_tri(1, 2, 40, 32, layout="bsnd", dtype=dtype))
     results.append(test_solve_tri(2, 2, 64, 32, layout="bsnd", dtype=dtype))
     results.append(test_solve_tri(1, 1, 35, 32, layout="bsnd", dtype=dtype))
     results.append(test_solve_tri(2, 2, 100, 32, layout="bsnd", dtype=dtype))
-    print("\n--- Network Cases layout [B, T, H, BT] ---")
     results.append(test_solve_tri(1, 4, 32768, 64, layout="bsnd", dtype=dtype))
     results.append(test_solve_tri(1, 4, 32768, 128, layout="bsnd", dtype=dtype))
     results.append(test_solve_tri(8, 8, 4096, 64, layout="bsnd", dtype=dtype))
@@ -292,7 +288,7 @@ def run_all_cases(dtype):
     #   - tb = 大尾块（cs>16 时 ChunkAlign→cs，触发 MBH 尾块路径），恒 < cs
     #   - ts = 小尾块（ChunkAlign→16，触发 MCH-only 尾块 + cur<cs 写回路径）
     # ================================================================
-    print("\n########## [Group 2] chunk_size sweep x fixed/varlen x tail/no-tail ##########")
+    print("\n########## [Group 2] combined cases (chunk_size sweep x bsnd/tnd x tail/no-tail) ##########")
     for cs in (16, 32, 64, 128):
         tb = (cs // 2 + 8) if cs > 16 else 8   # 大尾块（< cs）
         ts = 8                                  # 小尾块（→ cur=16）
@@ -300,15 +296,15 @@ def run_all_cases(dtype):
         print(f"\n=== chunk_size (BT) = {cs} ===")
 
         # ---- 定长 BSND ----
-        print(f"[BSND fixed, no-tail]  T={2 * cs}")
+        print(f"[BSND, no-tail]  T={2 * cs}")
         results.append(test_solve_tri(2, 2, 2 * cs, cs, layout="bsnd", dtype=dtype))
-        print(f"[BSND fixed, with-tail] T={2 * cs + tb} (tail={tb})")
+        print(f"[BSND, with-tail] T={2 * cs + tb} (tail={tb})")
         results.append(test_solve_tri(2, 2, 2 * cs + tb, cs, layout="bsnd", dtype=dtype))
 
         # ---- 变长 TND ----
-        print(f"[TND varlen, no-tail]  seqs=[{2 * cs},{cs}]")
+        print(f"[TND, no-tail]  seqs=[{2 * cs},{cs}]")
         results.append(test_solve_tri_varlen([2 * cs, cs], 2, cs, dtype=dtype))
-        print(f"[TND varlen, with-tail] seqs=[{2 * cs + tb},{cs + ts}] (tails={tb},{ts})")
+        print(f"[TND, with-tail] seqs=[{2 * cs + tb},{cs + ts}] (tails={tb},{ts})")
         results.append(test_solve_tri_varlen([2 * cs + tb, cs + ts], 2, cs, dtype=dtype))
 
     return results

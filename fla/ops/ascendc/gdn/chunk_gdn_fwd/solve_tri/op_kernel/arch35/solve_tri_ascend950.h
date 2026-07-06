@@ -208,7 +208,6 @@ public:
 
         SetFlag<AscendC::HardEvent::MTE1_M>(0);   // LoadData(MTE1, 写 l0A/l0B) -> Mmad(M, 读 l0A/l0B)
         WaitFlag<AscendC::HardEvent::MTE1_M>(0);
-        // PipeBarrier<PIPE_ALL>();
 
         AscendC::MmadParams mmadParams;
         mmadParams.m = chunkSize;
@@ -292,11 +291,9 @@ public:
             AuxMatrixGen(cur);
             SetFlag<AscendC::HardEvent::V_MTE3>(0);   // AuxMatrixGen(V, 写 ub_I) -> ub_to_l1(MTE3, 读 ub_I)
             WaitFlag<AscendC::HardEvent::V_MTE3>(0);
-            // AscendC::PipeBarrier<PIPE_ALL>();
             ub_to_l1(l1_I, ub_I, static_cast<uint32_t>(cur));
             SetFlag<AscendC::HardEvent::MTE3_MTE2>(0);   // ub_to_l1(MTE3) -> 下面对角块 gather(MTE2, 写 ub_A)
             WaitFlag<AscendC::HardEvent::MTE3_MTE2>(0);
-            // AscendC::PipeBarrier<PIPE_ALL>();
             last_chunk_size = cur;
         }
 
@@ -313,20 +310,16 @@ public:
         }
         SetFlag<AscendC::HardEvent::MTE2_MTE3>(0);   // gather(MTE2, 写 ub_A) -> ub_to_l1(MTE3, 读 ub_A)
         WaitFlag<AscendC::HardEvent::MTE2_MTE3>(0);
-        // AscendC::PipeBarrier<PIPE_ALL>();
 
         ub_to_l1(l1_Y, ub_A, static_cast<uint32_t>(cur));        // l1_Y = A(块对角)
         SetFlag<AscendC::HardEvent::MTE3_V>(0);   // ub_to_l1(MTE3, 读 ub_A) -> Sub(V, 读 ub_A) [RAR/顺序，保证 gather 已消费]
         WaitFlag<AscendC::HardEvent::MTE3_V>(0);
-        // AscendC::PipeBarrier<PIPE_ALL>();
         AscendC::Sub(ub_I_A, ub_I, ub_A, (int32_t)(cur * cur));  // I - A
         SetFlag<AscendC::HardEvent::V_MTE3>(0);   // Sub(V, 写 ub_I_A) -> ub_to_l1(MTE3, 读 ub_I_A)
         WaitFlag<AscendC::HardEvent::V_MTE3>(0);
-        // AscendC::PipeBarrier<PIPE_ALL>();
         ub_to_l1(l1_X, ub_I_A, static_cast<uint32_t>(cur));      // l1_X = I - A
         SetFlag<AscendC::HardEvent::MTE3_V>(0);   // ub_to_l1(MTE3) -> 下面 Duplicate ub_FullA(V) [顺序]
         WaitFlag<AscendC::HardEvent::MTE3_V>(0);
-        // AscendC::PipeBarrier<PIPE_ALL>();
         AscendC::CrossCoreSetFlag<0x4, PIPE_MTE3>(0x2);   // 数据就绪 -> AIC
 
         // MBH 预备（cur>16）：完整 A GM(ND)->ub_FullA(NZ)，尾块只读 actual_size 行（其余清 0），取负 -> l1_MNEG。
@@ -334,7 +327,6 @@ public:
             Duplicate(ub_FullA, (InDtype)0, (int32_t)(cur * cur));  // 清 padding 行
             SetFlag<AscendC::HardEvent::V_MTE2>(0);   // Duplicate(V, 写 ub_FullA) -> nd2nz DataCopy(MTE2, 写 ub_FullA) [WAW]
             WaitFlag<AscendC::HardEvent::V_MTE2>(0);
-            // AscendC::PipeBarrier<PIPE_ALL>();
             AscendC::Nd2NzParams p;
             p.ndNum = 1;
             p.nValue = static_cast<uint32_t>(actual_size);
@@ -347,13 +339,10 @@ public:
             AscendC::DataCopy(ub_FullA, gm_a[x_gm_offset], p);
             SetFlag<AscendC::HardEvent::MTE2_V>(0);   // nd2nz(MTE2, 写 ub_FullA) -> Muls(V, 读写 ub_FullA)
             WaitFlag<AscendC::HardEvent::MTE2_V>(0);
-            // AscendC::PipeBarrier<PIPE_ALL>();
             AscendC::Muls(ub_FullA, ub_FullA, (InDtype)(-1.0f), (int32_t)(cur * cur));
             SetFlag<AscendC::HardEvent::V_MTE3>(0);   // Muls(V, 写 ub_FullA) -> ub_to_l1(MTE3, 读 ub_FullA)
             WaitFlag<AscendC::HardEvent::V_MTE3>(0);
-            // AscendC::PipeBarrier<PIPE_ALL>();
             ub_to_l1(l1_MNEG, ub_FullA, static_cast<uint32_t>(cur));  // l1_MNEG = -A
-            // AscendC::PipeBarrier<PIPE_ALL>();   // 冗余：Process 中随后的 CrossCoreSetFlag<PIPE_MTE3> 已 flush MTE3
         }
     }
 
@@ -467,7 +456,6 @@ public:
         }
         SetFlag<AscendC::HardEvent::MTE1_M>(0); // LoadData(MTE1, 写 l0a_X/l0b_X) -> Mmad(M, 读 l0a_X/l0b_X)
         WaitFlag<AscendC::HardEvent::MTE1_M>(0);
-        // AscendC::PipeBarrier<PIPE_ALL>();
 
         AscendC::MmadParams mmadParams;
         mmadParams.m = cur;
@@ -534,10 +522,8 @@ public:
                     for (int32_t blockSize = 16; blockSize < cur; blockSize *= 2) {
                         ClearSlotUB(l1_X, cur);
                         ClearSlotUB(l1_INPUT, cur);
-                        // AscendC::PipeBarrier<PIPE_ALL>();   // 冗余：ClearSlotUB 与 ExtractFromUB 同为 MTE3 流水，天然有序
                         ExtractFromUB(l1_X, cur, blockSize, drvStart);     // drv -> l1_X
                         ExtractFromUB(l1_INPUT, cur, blockSize, othStart); // oth -> l1_INPUT
-                        // AscendC::PipeBarrier<PIPE_ALL>();   // 冗余：随后的 CrossCoreSetFlag<PIPE_MTE3> 已 flush MTE3
                         AscendC::CrossCoreSetFlag<0x4, PIPE_MTE3>(0x2);   // 提取就绪 -> AIC
                         AscendC::CrossCoreWaitFlag<0x4>(0x0);             // 等 AIC：本层矩乘/回写完成
                     }

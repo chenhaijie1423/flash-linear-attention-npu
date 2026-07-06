@@ -108,6 +108,10 @@ solve_tri/
 │   ├── solve_tri_tiling.h
 │   └── CMakeLists.txt
 ├── op_kernel/
+│   ├── arch35/
+│   │   ├── mem.h
+│   │   ├── solve_tri_ascend950.h
+│   │   └── solve_tri_ascend950_common.h
 │   ├── solve_tri.cpp
 │   ├── solve_tri_common.h
 │   ├── solve_tri_cube.h
