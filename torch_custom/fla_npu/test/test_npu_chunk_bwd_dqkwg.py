@@ -40,6 +40,21 @@ import pickle
 import math
 import sys
 
+def compare_data(golden_out, npu_out, threshold):
+    a = golden_out.cpu().reshape(1, golden_out.numel())[0]
+    b = npu_out.cpu().reshape(1, npu_out.numel())[0]
+    diff = torch.abs(a - b) / torch.max(torch.abs(a), torch.tensor(1))
+
+    max_diff, max_index = torch.max(diff, dim = 0)
+    c = max_diff < threshold
+    print("阈值为：", threshold)
+    print("最大误差为：", max_diff.item(), "，位于索引：", max_index.item())
+    print("两个值：", a[max_index.item()], b[max_index.item()])
+    if c==False:
+        print("test case fail")
+    else:
+        print("test case ok")
+
 def prepare_lens(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
     return cu_seqlens[1:] - cu_seqlens[:-1]
 
@@ -481,7 +496,7 @@ if __name__ == "__main__":
         [1,8,65536,64,torch.bfloat16,torch.bfloat16,0.0625,torch.tensor([0,16,20000,65536])],
         [1,32,65536,64,torch.float16,torch.float32,0.0442,torch.tensor([0,16,20000,50000,65536])],
         [1,32,262144,64,torch.bfloat16,torch.bfloat16,0.03125,torch.tensor([0,16,20000,50000,65536,210000,262144])],
-        [2,4,512,64,torch.bfloat16,torch.float32,0.088,None],  #21 [0,16,128] [0,16,135,512]
+        [1,8,4096,64,torch.float16,torch.float32,0.088,torch.tensor([0,1030,4001,4096])],  #21 [0,16,128] [0,16,135,512]
         [1,32,16384,64,torch.bfloat16,torch.float32,0.088,None],  #21 [0,16,128]
     ]
     device_id = int(os.environ.get("TEST_DEVICE_ID", 0))
@@ -641,5 +656,9 @@ if __name__ == "__main__":
     # single(dw_npu,dw,calc_count=100000,dtype=type_dict[dtype])
     # single(dg_npu,dg,calc_count=100000,dtype=type_dict[Gtype])
 
+    compare_data(dq, dq_npu, threshold=2**-8 + 2**-14)
+    compare_data(dk, dk_npu, threshold=2**-8 + 2**-14)
+    compare_data(dw, dw_npu, threshold=2**-8 + 2**-14)
+    compare_data(dg, dg_npu, threshold=2**-8 + 2**-14)
 
     print("All done!")
