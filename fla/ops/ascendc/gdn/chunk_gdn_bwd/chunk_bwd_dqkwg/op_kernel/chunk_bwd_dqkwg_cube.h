@@ -291,16 +291,17 @@ public:
         uint64_t numChunks;      // = CONST_NUM_CHUNKS;
         uint64_t n_ratio;        // HV / HK
         uint64_t aicCoreNum = 0; // CV 深融合 blockDim (cube/vector 共用), 由 host tiling 给出
+        bool isVarLen = false;
 
         CATLASS_DEVICE
         Params(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR h, GM_ADDR do_, GM_ADDR dh, GM_ADDR dv, GM_ADDR cu_seqlen,
                GM_ADDR chunk_indices, GM_ADDR dq, GM_ADDR dk, GM_ADDR workspace, uint64_t B, uint64_t HV, uint64_t HK,
-               uint64_t T, uint64_t K, uint64_t V, uint64_t BT, uint64_t numChunks, uint64_t n_ratio, uint64_t wsDw,
+               uint64_t T, uint64_t K, uint64_t V, uint64_t BT, uint64_t numChunks, uint64_t n_ratio, bool isVarLen, uint64_t wsDw,
                uint64_t wsBtxKSlots, uint64_t wsMm5, uint64_t wsDsTemp, uint64_t wsMm6, uint64_t wsMm7)
             : ptrQ(q), ptrK(k), ptrV(v), ptrH(h), ptrDo(do_), ptrDh(dh), ptrDv(dv), ptrCuSeqLens(cu_seqlen),
               ptrChunkIndices(chunk_indices), ptrDq(dq), ptrDk(dk), ptrWorkspace(workspace), wsDwOffset(wsDw),
               wsBtxKSyncSlotsPerHead(wsBtxKSlots), wsMm5Offset(wsMm5), wsDsTempOffset(wsDsTemp), wsMm6Offset(wsMm6),
-              wsMm7Offset(wsMm7), B(B), HV(HV), HK(HK), T(T), K(K), V(V), BT(BT), numChunks(numChunks), n_ratio(n_ratio)
+              wsMm7Offset(wsMm7), B(B), HV(HV), HK(HK), T(T), K(K), V(V), BT(BT), numChunks(numChunks), n_ratio(n_ratio), isVarLen(isVarLen)
         {
         }
     };
@@ -327,8 +328,13 @@ public:
         Arch::Resource<ArchTag> resource;
         uint32_t coreIdx = AscendC::GetBlockIdx();
         uint32_t coreNum = params.aicCoreNum; // CV 深融合 blockDim (cube/vector 共用)
-
         uint32_t coreLoops = params.B * params.numChunks;
+
+        GlobalTensor<uint64_t> cuSeqlensTensor, chunkIndicesTensor;
+        if (params.isVarLen) {
+            cuSeqlensTensor.SetGlobalBuffer((__gm__ uint64_t *)params.ptrCuSeqLens);
+            chunkIndicesTensor.SetGlobalBuffer((__gm__ uint64_t *)params.ptrChunkIndices);
+        }
 
         // Layout 创建
         auto layoutBTxK = LayoutRowMajor::MakeLayout<ElementA>(params.BT, params.K);
@@ -352,8 +358,8 @@ public:
             uint32_t loopEnd = DqkwgGroupEnd(loopBase, coreLoops, coreNum, (uint32_t)params.wsBtxKSyncSlotsPerHead);
             // ========== A_cube: dw = dv @ h^T, 然后 mm5 = q @ k^T ==========
             for (uint32_t loopIdx = loopBase; loopIdx < loopEnd; loopIdx += coreNum) {
-                GetChunkOffset(params.ptrCuSeqLens, params.ptrChunkIndices, params.B, params.HV, params.T, params.BT,
-                               loopIdx, bos, eos);
+                GetChunkOffset(cuSeqlensTensor, chunkIndicesTensor, params.B, params.HV, params.T, params.BT,
+                               loopIdx, bos, eos, params.isVarLen);
                 uint32_t actual_chunk_len = eos - bos;
                 uint32_t bIdx = loopIdx / params.numChunks;
                 uint32_t chunkIdx = loopIdx % params.numChunks;
@@ -445,8 +451,8 @@ public:
 
             // ========== B_cube: ds = do @ v^T -> wsDsTemp ==========
             for (uint32_t loopIdx = loopBase; loopIdx < loopEnd; loopIdx += coreNum) {
-                GetChunkOffset(params.ptrCuSeqLens, params.ptrChunkIndices, params.B, params.HV, params.T, params.BT,
-                               loopIdx, bos, eos);
+                GetChunkOffset(cuSeqlensTensor, chunkIndicesTensor, params.B, params.HV, params.T, params.BT,
+                               loopIdx, bos, eos, params.isVarLen);
                 uint32_t actual_chunk_len = eos - bos;
                 uint32_t bIdx = loopIdx / params.numChunks;
                 uint32_t chunkIdx = loopIdx % params.numChunks;
@@ -490,8 +496,8 @@ public:
             // mm6 读取 B_vector 产出的 ds_temp(c); 进入 C_cube(c0)=task 2M 时 vector 已完成到 task 2M-2 >=
             // B_vector(c0)=task M (M>=2)。
             for (uint32_t loopIdx = loopBase; loopIdx < loopEnd; loopIdx += coreNum) {
-                GetChunkOffset(params.ptrCuSeqLens, params.ptrChunkIndices, params.B, params.HV, params.T, params.BT,
-                               loopIdx, bos, eos);
+                GetChunkOffset(cuSeqlensTensor, chunkIndicesTensor, params.B, params.HV, params.T, params.BT,
+                               loopIdx, bos, eos, params.isVarLen);
                 uint32_t actual_chunk_len = eos - bos;
                 uint32_t bIdx = loopIdx / params.numChunks;
                 uint32_t chunkIdx = loopIdx % params.numChunks;
@@ -587,8 +593,8 @@ public:
 
             // ========== D_cube: dk_inner = v @ dh -> ptrDk, 然后 mm7 = ds_temp^T @ q -> wsMm7 ==========
             for (uint32_t loopIdx = loopBase; loopIdx < loopEnd; loopIdx += coreNum) {
-                GetChunkOffset(params.ptrCuSeqLens, params.ptrChunkIndices, params.B, params.HV, params.T, params.BT,
-                               loopIdx, bos, eos);
+                GetChunkOffset(cuSeqlensTensor, chunkIndicesTensor, params.B, params.HV, params.T, params.BT,
+                               loopIdx, bos, eos, params.isVarLen);
                 uint32_t actual_chunk_len = eos - bos;
                 uint32_t bIdx = loopIdx / params.numChunks;
                 uint32_t chunkIdx = loopIdx % params.numChunks;
@@ -735,6 +741,7 @@ private:
     uint64_t BT;
     uint64_t numChunks;
     uint64_t aicCoreNum; // CV 深融合 blockDim (cube/vector 共用)
+    bool isVarLen;
 
     // Workspace 偏移
     uint64_t wsDwOffset;
@@ -758,6 +765,7 @@ __aicore__ inline void ChunkBwdDqkwgCubeProcess<DataType, GType>::Init(const Chu
     BT = tiling.BT;
     numChunks = tiling.numChunks;
     aicCoreNum = tiling.aicCoreNum;
+    isVarLen = (tiling.isVarLen == 1);
     wsDwOffset = tiling.wsDwOffset;
     wsBtxKSyncSlotsPerHead = tiling.wsBtxKSyncSlotsPerHead;
     wsMm5Offset = tiling.wsMm5Offset;
@@ -864,7 +872,7 @@ __aicore__ inline void ChunkBwdDqkwgCubeProcess<DataType, GType>::Process()
         MatmulKernelTiled kernel;
         typename MatmulKernelTiled::Params params(ptrQ, ptrK, ptrV, ptrH, ptrDo, ptrDh, ptrDv, ptrCuSeqLen,
                                                   ptrChunkIndices, ptrDq, ptrDk, ptrWorkspace, B, HV, HK, T, K, V, BT,
-                                                  numChunks, n_ratio, wsDwOffset, wsBtxKSyncSlotsPerHead, wsMm5Offset,
+                                                  numChunks, n_ratio, isVarLen, wsDwOffset, wsBtxKSyncSlotsPerHead, wsMm5Offset,
                                                   wsDsTempOffset, wsMm6Offset, wsMm7Offset);
         params.aicCoreNum = aicCoreNum;
         kernel(params);
@@ -872,7 +880,7 @@ __aicore__ inline void ChunkBwdDqkwgCubeProcess<DataType, GType>::Process()
         MatmulKernel kernel;
         typename MatmulKernel::Params params(ptrQ, ptrK, ptrV, ptrH, ptrDo, ptrDh, ptrDv, ptrCuSeqLen, ptrChunkIndices,
                                              ptrDq, ptrDk, ptrWorkspace, B, HV, HK, T, K, V, BT, numChunks, n_ratio,
-                                             wsDwOffset, wsBtxKSyncSlotsPerHead, wsMm5Offset, wsDsTempOffset,
+                                             isVarLen, wsDwOffset, wsBtxKSyncSlotsPerHead, wsMm5Offset, wsDsTempOffset,
                                              wsMm6Offset, wsMm7Offset);
         params.aicCoreNum = aicCoreNum;
         kernel(params);

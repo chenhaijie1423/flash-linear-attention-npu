@@ -17,7 +17,12 @@
 
 #include "kernel_operator.h"
 
+using namespace AscendC;
+
 constexpr int32_t CAL_NUM_FLOAT = 64; // API一次能处理256B，能计算64个float元素
+constexpr int32_t NUM_PER_REP_FP32 = 64;
+constexpr int32_t MOD_64_MASK = 0x3f;
+constexpr int32_t LOG2_64 = 6;
 
 // ============================================================================
 // CV 深融合同步信号 (chunk-interleaved A/B/C/D pipeline) —— raw 信用流水 (与基线同机制)
@@ -141,30 +146,37 @@ __aicore__ inline uint64_t DqkwgShortBtbRingElemOffset(uint32_t coreIdx, uint32_
 // cube 端: 产出 ready (FixPipe 写回 GM 后) / 取一个信用 (节流, 默认 wait 模式与基线一致)
 __aicore__ inline void SetCubeReady()
 {
-    AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(SYNC_AIC_AIV_FLAG_0);
+    CrossCoreSetFlag<0x2, PIPE_FIX>(SYNC_AIC_AIV_FLAG_0);
 }
 __aicore__ inline void WaitCredit()
 {
-    AscendC::CrossCoreWaitFlag(SYNC_AIV_AIC_FLAG_0);
+    CrossCoreWaitFlag(SYNC_AIV_AIC_FLAG_0);
 }
 // vector 端: 等待 cube ready (MTE2 读 GM 前) / 回一个信用 (MTE3 写 GM 后)
 __aicore__ inline void WaitCubeReady()
 {
-    AscendC::CrossCoreWaitFlag(SYNC_AIC_AIV_FLAG_0);
+    CrossCoreWaitFlag(SYNC_AIC_AIV_FLAG_0);
 }
 __aicore__ inline void SetVecCredit()
 {
-    AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(SYNC_AIV_AIC_FLAG_0);
+    CrossCoreSetFlag<0x2, PIPE_MTE3>(SYNC_AIV_AIC_FLAG_0);
 }
 
 constexpr uint32_t FP32_PER_REPEAT = 64;
 
 #define CEIL_DIV(x, y) (((x) + (y) - 1) / (y))
 
-__aicore__ void inline GetChunkOffset(GM_ADDR cu_seqlens, GM_ADDR chunk_indices, uint64_t B, uint64_t HV, uint64_t T,
-                                      uint64_t chunkSize, uint32_t loopIdx, uint32_t &bos, uint32_t &eos)
+__aicore__ inline void GetChunkOffset(GlobalTensor<uint64_t> cuSeqlensTensor, GlobalTensor<uint64_t> chunkIndicesTensor, uint64_t B, uint64_t HV, uint64_t T,
+                                      uint64_t chunkSize, uint32_t loopIdx, uint32_t &bos, uint32_t &eos, bool isVarLen)
 {
-    if (cu_seqlens == nullptr) {
+    if (isVarLen) {
+        uint32_t seqIdx = chunkIndicesTensor.GetValue(2 * loopIdx);
+        uint32_t chunkIdx = chunkIndicesTensor.GetValue(2 * loopIdx + 1);
+        uint32_t curSeqBegin = cuSeqlensTensor.GetValue(seqIdx);
+        uint32_t curSeqEnd = cuSeqlensTensor.GetValue(seqIdx + 1);
+        bos = curSeqBegin + chunkIdx * chunkSize;
+        eos = bos + chunkSize > curSeqEnd ? curSeqEnd : bos + chunkSize;
+    } else {
         uint32_t coreLoopsInB = CEIL_DIV(T, chunkSize);
         uint32_t chunkIdx = loopIdx % coreLoopsInB;
         uint32_t bIdx = loopIdx / coreLoopsInB;
@@ -172,21 +184,26 @@ __aicore__ void inline GetChunkOffset(GM_ADDR cu_seqlens, GM_ADDR chunk_indices,
         eos = bos + chunkSize > T ? T : bos + chunkSize;
         bos += (bIdx * HV * T);
         eos += (bIdx * HV * T);
-    } else {
-        AscendC::GlobalTensor<uint64_t> cuSeqlensTensor;
-        AscendC::GlobalTensor<uint64_t> chunkIndicesTensor;
-        cuSeqlensTensor.SetGlobalBuffer((__gm__ uint64_t *)cu_seqlens);
-        chunkIndicesTensor.SetGlobalBuffer((__gm__ uint64_t *)chunk_indices);
-
-        uint32_t seqIdx = chunkIndicesTensor.GetValue(2 * loopIdx);
-        uint32_t chunkIdx = chunkIndicesTensor.GetValue(2 * loopIdx + 1);
-        uint32_t curSeqBegin = cuSeqlensTensor.GetValue(seqIdx);
-        uint32_t curSeqEnd = cuSeqlensTensor.GetValue(seqIdx + 1);
-        bos = curSeqBegin + chunkIdx * chunkSize;
-        eos = bos + chunkSize > curSeqEnd ? curSeqEnd : bos + chunkSize;
     }
+}
 
-    return;
+// count <= 64 * 256(16K)
+__aicore__ inline void ReduceSumCustom(const LocalTensor<float>& dstLocal, const LocalTensor<float>& srcLocal,
+                                       uint32_t count)
+{
+    uint32_t repeatTimes = count >> LOG2_64;
+    uint32_t tailCount = count & MOD_64_MASK;
+
+    BinaryRepeatParams repeatParams = {1, 1, 1, 0, DEFAULT_REPEAT_STRIDE, 0};
+    if (likely(repeatTimes > 1)) {
+        Add(srcLocal, srcLocal[NUM_PER_REP_FP32], srcLocal, NUM_PER_REP_FP32, repeatTimes - 1, repeatParams);
+        PipeBarrier<PIPE_V>();
+    }
+    if (unlikely(tailCount > 0)) {
+        Add(srcLocal, srcLocal[repeatTimes << LOG2_64], srcLocal, tailCount, 1, repeatParams);
+        PipeBarrier<PIPE_V>();
+    }
+    WholeReduceSum(dstLocal, srcLocal, repeatTimes > 0 ? NUM_PER_REP_FP32 : count, 1, 0, 1, 0);
 }
 
 #endif // CHUNK_BWD_DQKWG_COMMON_H
