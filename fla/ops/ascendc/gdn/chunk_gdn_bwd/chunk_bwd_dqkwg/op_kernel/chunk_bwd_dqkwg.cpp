@@ -41,20 +41,20 @@ __global__ __aicore__ void chunk_bwd_dqkwg(GM_ADDR q,             // [B, HK, T, 
     // 设置溢出处理
     AscendCUtils::SetOverflow(1);
 
+    // 使用 C-V 融合模式
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    GET_TILING_DATA(tilingData, tiling);
+    GM_ADDR userWorkspace = AscendC::GetUserWorkspace(workspace);
+    if (userWorkspace == nullptr) {
+        return;
+    }
+
     // 根据 TilingKey 选择执行路径
     if (TILING_KEY_IS(1)) {
-        // 使用 C-V 融合模式
-        KERNEL_TASK_TYPE(1, KERNEL_TYPE_MIX_AIC_1_2);
-        GET_TILING_DATA(tilingData, tiling);
-        GM_ADDR userWorkspace = AscendC::GetUserWorkspace(workspace);
-        if (userWorkspace == nullptr) {
-            return;
-        }
         // AIC (Cube) 端执行
-
         if ASCEND_IS_AIC {
             ChunkBwdDqkwgCubeProcess<DTYPE_Q, DTYPE_G> cubeProcess(q, k, v, h, do_, dh, dv, cu_seqlens, chunk_indices,
-                                                                   dq, dk, userWorkspace);
+                                                                   dq, dk, dw, userWorkspace);
             cubeProcess.Init(tilingData);
             cubeProcess.Process();
         }

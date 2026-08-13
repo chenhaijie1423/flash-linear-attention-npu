@@ -182,9 +182,8 @@ ASCENDC_EXTERN_C ge::graphStatus TilingChunkBwdDqkwg(gert::TilingContext* contex
         size_t shortBtxK = align32(static_cast<size_t>(ringCoreSlots) * shortD * HV *BT * K * FP16_SIZE);
         size_t sharedBtxK = align32(static_cast<size_t>(ringCoreSlots) * g * HV *BT * K * FP16_SIZE);  // mm5+mm7 group
         size_t groupBtb = align32(static_cast<size_t>(ringCoreSlots) * g * HV *BT * BT * FP16_SIZE);
-        size_t shortBtb = align32(static_cast<size_t>(ringCoreSlots) * shortD * HV *BT * BT * FP16_SIZE);
         size_t dgLast = align32(static_cast<size_t>(ringCoreSlots) * g * HV *FP32_SIZE);
-        return shortBtxK + sharedBtxK + groupBtb + shortBtb + dgLast;
+        return shortBtxK + sharedBtxK + groupBtb + dgLast;
     };
 
     // 选 G: 取 <= min(main, L2 驻留预算) 的最大 G。**memory-bound 关键 (msprof 实锤)**: 大 H/大 BT 的 case
@@ -221,15 +220,14 @@ ASCENDC_EXTERN_C ge::graphStatus TilingChunkBwdDqkwg(gert::TilingContext* contex
     // short 环深自适应 (= 内核 DqkwgShortRingDepthFromGroup 同公式): dw/mm6/mul1 只需 2G-1 个 slot, 固定 8 严重过配。
     // 大 H/大 BT 的 memory-bound case (G=1~2) 把 short 环砍掉一大半 -> 环贴近 L2 -> 缓解 FixPipe/MTE2 的 L2 miss。
     const int64_t adaptiveShortDepth = (groupRingDepth / 2 >= 2) ? (groupRingDepth / 2) : 2;  // 2G (G=4→8 复现原值; G<4 收缩), 地板 2
-    const size_t shortBtxKSize = align32(static_cast<size_t>(ringCoreSlots) * adaptiveShortDepth * HV *BT * K * FP16_SIZE);
+    const size_t shortBtxKSize = align32(static_cast<size_t>(ringCoreSlots) * adaptiveShortDepth * HV * BT * K * FP16_SIZE);
     // mm7 改用 group 环 (与 mm5 同槽, 单写, stage B/D 时序错开), 故 mm5/mm7 共享区 = group 深度 (不再 max(group,short))。
-    const size_t sharedBtxKSize = align32(static_cast<size_t>(ringCoreSlots) * groupRingDepth * HV *BT * K * FP16_SIZE);
-    const size_t groupBtbSize = align32(static_cast<size_t>(ringCoreSlots) * groupRingDepth * HV *BT * BT * FP16_SIZE);
-    const size_t shortBtbSize = align32(static_cast<size_t>(ringCoreSlots) * adaptiveShortDepth * HV *BT * BT * FP16_SIZE);
-    size_t dgLastSize = align32(static_cast<size_t>(ringCoreSlots) * groupRingDepth * HV *FP32_SIZE);
+    const size_t sharedBtxKSize = align32(static_cast<size_t>(ringCoreSlots) * groupRingDepth * HV * BT * K * FP16_SIZE);
+    const size_t groupBtbSize = align32(static_cast<size_t>(ringCoreSlots) * groupRingDepth * HV * BT * BT * FP16_SIZE);
+    size_t dgLastSize = align32(static_cast<size_t>(ringCoreSlots) * groupRingDepth * HV * FP32_SIZE);
 
     size_t offset = 0;
-    size_t wsDwOffset = offset;
+    size_t wsMm6Offset = offset;
     offset += shortBtxKSize;
 
     size_t wsMm5Offset = offset;
@@ -238,13 +236,9 @@ ASCENDC_EXTERN_C ge::graphStatus TilingChunkBwdDqkwg(gert::TilingContext* contex
     size_t wsDsTempOffset = offset;
     offset += groupBtbSize;
 
-    size_t wsMul1Offset = offset;
-    offset += shortBtbSize;
-
     size_t wsDgLastOffset = offset;
     offset += dgLastSize;
 
-    size_t wsMm6Offset = wsDwOffset;
     size_t wsMm7Offset = wsMm5Offset;
     size_t totalUserWorkspace = offset;
 
@@ -253,7 +247,7 @@ ASCENDC_EXTERN_C ge::graphStatus TilingChunkBwdDqkwg(gert::TilingContext* contex
     workspaces[0] = static_cast<size_t>(sysWorkspaceSize + totalUserWorkspace);
 
     // 设置 block 数量
-    context->SetBlockDim(aicNum);
+    context->SetBlockDim(ringCoreSlots);
     context->SetScheduleMode(1); // mixed AIC/AIV schedule
 
     // 填充 TilingData
@@ -270,16 +264,13 @@ ASCENDC_EXTERN_C ge::graphStatus TilingChunkBwdDqkwg(gert::TilingContext* contex
     tilingData.set_mul0RowNum(V == 256 ? 16 : 32);
     tilingData.set_aicCoreNum(static_cast<uint32_t>(aicNum));
 
-    tilingData.set_wsDwOffset(wsDwOffset);
     tilingData.set_wsBtxKSyncSlotsPerHead(static_cast<uint64_t>(groupRingDepth));
     tilingData.set_wsDgLastOffset(wsDgLastOffset);
     tilingData.set_dgLastSize(dgLastSize);
     tilingData.set_wsMm5Offset(wsMm5Offset);
     tilingData.set_wsDsTempOffset(wsDsTempOffset);
-    tilingData.set_totalWorkspaceSize(totalUserWorkspace);
     tilingData.set_wsMm6Offset(wsMm6Offset);
     tilingData.set_wsMm7Offset(wsMm7Offset);
-    tilingData.set_wsMul1Offset(wsMul1Offset);
 
     // 检查是否有 cu_seqlens 输入来判断 IS_VARLEN
     tilingData.set_isVarLen(isVarLen);

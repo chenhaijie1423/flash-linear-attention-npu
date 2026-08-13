@@ -15,7 +15,6 @@
 #ifndef CHUNK_BWD_DQKWG_TILING_PROCESSOR_H
 #define CHUNK_BWD_DQKWG_TILING_PROCESSOR_H
 
-#include "../../op_kernel/chunk_bwd_dqkwg_struct.h"
 #include "exe_graph/runtime/storage_shape.h"
 #include <register/op_impl_registry.h>
 #include "tiling_base/data_copy_transpose_tiling.h"
