@@ -121,36 +121,37 @@ static __simd_vf__ inline void Mul1Half(
 //   与 DkStateMUL2 同构 (factor = scale*exp(g[i]) 而非 exp(gLast-g[i])), 阶段 2 一致。
 // ============================================================================
 static __simd_vf__ inline void DqState(
-    __ubuf__ float *dqFp32,        // [realBt, kDim] in/out (fp32)
+    __ubuf__ float *dqStateFp32,   // [realBt, kDim = 128] out (fp32)
+    __ubuf__ float *dqFp32,        // [realBt, kDim = 128] in (fp32)
     __ubuf__ float *gFp32,         // [realBt] gate (fp32, 原值只读)
-    __ubuf__ float *factorScratch, // [>= realBt + V_LENGTH_FP32] caller 分配
-    uint16_t realBt,
-    uint16_t kDim,
+    __ubuf__ float *factorScratch, // [realBt] factor (fp32, 临时存储)
+    uint32_t realBt,
     float scale)
 {
-    RegTensor<float> regG, regFactor, regScale, regDq, regOut;
-    MaskReg maskFull = CreateMask<float, MaskPattern::ALL>();
-    Duplicate(regScale, scale);
+    RegTensor<float> regG, regFactor, regDq1, regDq2, regOut1, regOut2;
 
     // 阶段 1: factor[i] = scale * exp(g[i]) -> factorScratch
-    for (uint16_t blk = 0; blk < realBt; blk += V_LENGTH_FP32) {
-        uint32_t remain = realBt - blk;
-        MaskReg maskG = UpdateMask<float>(remain);
-        LoadIn<float, false>(regG, gFp32 + blk);
+    uint16_t gLoopTimes = static_cast<uint16_t>(realBt / V_LENGTH_FP32);
+    uint32_t gLength = realBt;
+    MaskReg maskAll = CreateMask<float, MaskPattern::ALL>();
+    MaskReg maskG;
+    for (uint16_t j = 0; j < gLoopTimes; j++) {
+        maskG = UpdateMask<float>(gLength);
+        LoadAlign<float>(regG, gFp32 + j * V_LENGTH_FP32);
         Exp(regFactor, regG, maskG);
-        Mul(regFactor, regFactor, regScale, maskG);
-        StoreAlign(factorScratch + blk, regFactor, maskG);
+        Muls(regFactor, regFactor, scale, maskG);
+        StoreAlign<float>(factorScratch + j * V_LENGTH_FP32, regFactor, maskG);
     }
+    LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
     // 阶段 2: dq[i][:] *= factor[i]  (与 DkStateMUL2 阶段 2 一致)
     for (uint16_t i = 0; i < realBt; ++i) {
-        LoadIn<float, true>(regFactor, factorScratch + i);   // 广播 factor[i]
-        for (uint16_t k = 0; k < kDim; k += V_LENGTH_FP32) {
-            uint32_t kRemain = kDim - k;
-            MaskReg maskK = UpdateMask<float>(kRemain);
-            LoadIn<float, false>(regDq, dqFp32 + i * kDim + k);
-            Mul(regOut, regDq, regFactor, maskK);
-            StoreAlign(dqFp32 + i * kDim + k, regOut, maskK);
-        }
+        LoadAlign<float, LoadDist::DIST_BRC_B32>(regFactor, factorScratch + i);
+        LoadAlign<float, PostLiteral::POST_MODE_UPDATE>(regDq1, dqFp32, V_LENGTH_FP32);
+        LoadAlign<float, PostLiteral::POST_MODE_UPDATE>(regDq2, dqFp32, V_LENGTH_FP32);
+        Mul(regOut1, regDq1, regFactor, maskAll);
+        Mul(regOut2, regDq2, regFactor, maskAll);
+        StoreAlign<float, PostLiteral::POST_MODE_UPDATE>(dqStateFp32, regOut1, V_LENGTH_FP32, maskAll);
+        StoreAlign<float, PostLiteral::POST_MODE_UPDATE>(dqStateFp32, regOut2, V_LENGTH_FP32, maskAll);
     }
 }
 
@@ -215,50 +216,6 @@ static __simd_vf__ inline void DgLastMulAccum(
         }
         StoreAlign<float, PostLiteral::POST_MODE_UPDATE>(sumFp32, regProd0, V_LENGTH_FP32, maskAll);
         StoreAlign<float, PostLiteral::POST_MODE_UPDATE>(sumFp32, regProd1, V_LENGTH_FP32, maskAll);
-    }
-}
-
-// ============================================================================
-// P3-8: BDsTempMulCast  (ds_temp = ds*mul1; ds2 = ds_temp*mm5; out ds_temp(half) + ds2(fp32))
-//   MemBase: ProcessB L783-817 (Cast ds/mul1/mm5 -> Mul ds*mul1 -> Mul ds_temp*mm5 -> Cast ds_temp)
-//   mul1 由 caller 预 cast 到 fp32 (大 case 已 fp32, 小 case caller cast)。归约仍走 MemBase。
-// ============================================================================
-template <typename HalfT>
-static __simd_vf__ inline void BDsTempMulCast(
-    __ubuf__ HalfT *dsTempHalfOut, // [elemCount] ds_temp output (half / bfloat16_t)
-    __ubuf__ float *ds2Fp32Out,    // [elemCount] ds2 = ds_temp*mm5 output (fp32, 供 B 端归约)
-    __ubuf__ HalfT *dsHalf,        // [elemCount] ds (half / bfloat16_t)
-    __ubuf__ float *mul1Fp32,      // [elemCount] mul1 (fp32, caller 预 cast)
-    __ubuf__ HalfT *mm5Half,       // [elemCount] mm5 (half / bfloat16_t)
-    uint16_t elemCount)
-{
-    RegTensor<HalfT> regDsH, regMm5H, regTempH;
-    RegTensor<float> regDsF0, regDsF1, regM10, regM11, regTemp0, regTemp1;
-    RegTensor<float> regMm5F0, regMm5F1, regDs20, regDs21;
-    uint32_t halfRemaining = elemCount;
-    uint32_t floatRemaining = elemCount;
-    for (uint16_t blk = 0; blk < elemCount; blk += V_LENGTH_HALF) {
-        MaskReg maskH = UpdateMask<HalfT>(halfRemaining);
-        MaskReg maskF0 = UpdateMask<float>(floatRemaining);
-        MaskReg maskF1 = UpdateMask<float>(floatRemaining);
-        // ds_temp = ds * mul1
-        LoadIn<HalfT, false>(regDsH, dsHalf + blk);
-        CastHalf2Float<HalfT>(regDsF0, regDsF1, regDsH, maskH);
-        LoadIn<float, false>(regM10, mul1Fp32 + blk);
-        LoadIn<float, false>(regM11, mul1Fp32 + blk + V_LENGTH_FP32);
-        Mul(regTemp0, regDsF0, regM10, maskF0);
-        Mul(regTemp1, regDsF1, regM11, maskF1);
-        // ds2 = ds_temp * mm5
-        LoadIn<HalfT, false>(regMm5H, mm5Half + blk);
-        CastHalf2Float<HalfT>(regMm5F0, regMm5F1, regMm5H, maskH);
-        Mul(regDs20, regTemp0, regMm5F0, maskF0);
-        Mul(regDs21, regTemp1, regMm5F1, maskF1);
-        // 输出: ds_temp -> half, ds2 -> fp32
-        Cast<HalfT, float, ctFp322HalfOne>(regTempH, regTemp1, maskF1);
-        Cast<HalfT, float, ctFp322HalfZero>(regTempH, regTemp0, maskF0);
-        StoreAlign(dsTempHalfOut + blk, regTempH, maskH);
-        StoreAlign(ds2Fp32Out + blk, regDs20, maskF0);
-        StoreAlign(ds2Fp32Out + blk + V_LENGTH_FP32, regDs21, maskF1);
     }
 }
 

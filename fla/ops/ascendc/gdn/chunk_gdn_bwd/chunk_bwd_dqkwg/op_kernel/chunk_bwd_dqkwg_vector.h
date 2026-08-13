@@ -705,13 +705,12 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessCVect
 
                 // dq_state = dq_inner * exp(g)[:,None] * scale
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
-                DqState((__ubuf__ float *)tensorDqInFp32.GetPhyAddr(), (__ubuf__ float *)tensorGFp32.GetPhyAddr(),
-                        (__ubuf__ float *)tensorShareTmpFp32.GetPhyAddr(), static_cast<uint16_t>(real_BT),
-                        static_cast<uint16_t>(K), scale);
+                DqState((__ubuf__ float *)tensorDqInFp32.GetPhyAddr(), (__ubuf__ float *)tensorDqInFp32.GetPhyAddr(), 
+                        (__ubuf__ float *)tensorGFp32.GetPhyAddr(), (__ubuf__ float *)tensorShareTmpFp32.GetPhyAddr(), real_BT, scale);
 #else
                 Exp(tensorGFp32, tensorGFp32, BT);
                 PipeBarrier<PIPE_V>();
-                Muls(tensorGFp32, tensorGFp32, static_cast<float>(scale), BT);
+                Muls(tensorGFp32, tensorGFp32, scale, BT);
                 PipeBarrier<PIPE_V>();
                 Brcb(tensorShareTmpFp32, tensorGFp32, CEIL_DIV(real_BT, 8), {1, 8});
                 PipeBarrier<PIPE_V>();
