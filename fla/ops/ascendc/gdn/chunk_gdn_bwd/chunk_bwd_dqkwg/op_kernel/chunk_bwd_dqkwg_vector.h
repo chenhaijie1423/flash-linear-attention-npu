@@ -59,8 +59,8 @@ private:
     // mul1 一个 row-half 的计算 (= A 的 Part2 per-head 内核, 输出 fp32 到 outFp32[half] )。
     // A (小 case) 调它后 cast+写 GM; B (大 case) 调它两次 (两个 row-half) 后直接乘 ds, 省掉 mul1 GM 往返。
     __aicore__ inline void ComputeMul1HalfFp32(const LocalTensor<float> &outFp32, const LocalTensor<float> &tensorMaskA,
-                                               const LocalTensor<float> &tensorBrcbTemp, const LocalTensor<float> &tensorGFp32Right, 
-                                               uint64_t gOffset, uint32_t BT_sub_start, uint32_t real_BT, uint32_t actual_chunk_len);
+                                               const LocalTensor<float> &tensorBrcbTemp, const LocalTensor<float> &tensorGFp32Left, 
+                                               const LocalTensor<float> &tensorGFp32Right, uint64_t gOffset, uint32_t BT_sub_start, uint32_t real_BT);
 
     __aicore__ inline void CopyGateWithPad(const LocalTensor<GType> &dst, const GlobalTensor<GType> &src, uint64_t offset,
                                            uint32_t validLen, uint32_t totalLen);
@@ -308,43 +308,20 @@ ChunkBwdDqkwgVectorProcess<DataType, GType>::CopyGateWithPad(const LocalTensor<G
 template <typename DataType, typename GType>
 __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ComputeMul1HalfFp32(
     const LocalTensor<float> &outFp32, const LocalTensor<float> &tensorMaskA, 
-    const LocalTensor<float> &tensorBrcbTemp, const LocalTensor<float> &tensorGFp32Right, 
-    uint64_t gOffset, uint32_t BT_sub_start, uint32_t real_BT, uint32_t actual_chunk_len)
+    const LocalTensor<float> &tensorBrcbTemp, const LocalTensor<float> &tensorGFp32Left, 
+    const LocalTensor<float> &tensorGFp32Right, uint64_t gOffset, uint32_t BT_sub_start, uint32_t real_BT)
 {
-    if (real_BT == 0) {
-        return;
-    }
-    {
-        auto tensorGIn = inQue3.AllocTensor<GType>();
-        if constexpr (std::is_same<GType, float>::value) {
-            CopyGateWithPad(tensorGIn, gmG, gOffset, actual_chunk_len, BT);
-        } else {
-            CopyGateWithPad(tensorGIn[BT], gmG, gOffset, actual_chunk_len, BT);
-        }
-        inQue3.EnQue(tensorGIn);
-    }
-    auto tensorGIn = inQue3.DeQue<GType>();
-    auto tensorGFp32Left = tensorGIn.template ReinterpretCast<float>();
-    if constexpr (!std::is_same<GType, float>::value) {
-        Cast(tensorGFp32Left, tensorGIn[BT], RoundMode::CAST_NONE, BT);
-    }
-    PipeBarrier<PIPE_V>();
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
     if (BT == 64) {
-        if (BT_sub_start == 0) {
-            Mul1Half<64, 0>((__ubuf__ float *)outFp32.GetPhyAddr(), (__ubuf__ float *)tensorGFp32Left.GetPhyAddr(),
-                            (__ubuf__ float *)tensorMaskA.GetPhyAddr(), static_cast<uint16_t>(real_BT));
-        } else {
-            Mul1Half<64, 32>((__ubuf__ float *)outFp32.GetPhyAddr(), (__ubuf__ float *)tensorGFp32Left.GetPhyAddr(),
-                             (__ubuf__ float *)tensorMaskA.GetPhyAddr(), static_cast<uint16_t>(real_BT));
-        }
+        Mul1Half<64, 0>((__ubuf__ float *)outFp32.GetPhyAddr(), (__ubuf__ float *)tensorGFp32Left.GetPhyAddr(),
+                        (__ubuf__ float *)tensorMaskA.GetPhyAddr(), static_cast<uint16_t>(real_BT), scale);
     } else {
         if (BT_sub_start == 0) {
             Mul1Half<128, 0>((__ubuf__ float *)outFp32.GetPhyAddr(), (__ubuf__ float *)tensorGFp32Left.GetPhyAddr(),
-                             (__ubuf__ float *)tensorMaskA.GetPhyAddr(), static_cast<uint16_t>(real_BT));
+                             (__ubuf__ float *)tensorMaskA.GetPhyAddr(), static_cast<uint16_t>(real_BT), scale);
         } else {
             Mul1Half<128, 64>((__ubuf__ float *)outFp32.GetPhyAddr(), (__ubuf__ float *)tensorGFp32Left.GetPhyAddr(),
-                              (__ubuf__ float *)tensorMaskA.GetPhyAddr(), static_cast<uint16_t>(real_BT));
+                              (__ubuf__ float *)tensorMaskA.GetPhyAddr(), static_cast<uint16_t>(real_BT), scale);
         }
     }
 #else
@@ -358,7 +335,7 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ComputeMul1H
         PipeBarrier<PIPE_V>();
         Exp(outFp32, outFp32, real_BT * BT);
         PipeBarrier<PIPE_V>();
-        Mul(outFp32, outFp32, tensorMaskA[BT_sub_start * 64], 32 * 64);
+        Mul(outFp32, outFp32, tensorMaskA, real_BT * BT);
         PipeBarrier<PIPE_V>();
     } else {
         AscendC::Copy(outFp32, tensorGFp32Right, CAL_NUM_FLOAT, real_BT, {1, 1, 16, 0});
@@ -375,18 +352,20 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ComputeMul1H
         Exp(outFp32, outFp32, real_BT * BT);
         PipeBarrier<PIPE_V>();
         BinaryRepeatParams binaryRepeatParams{1, 1, 1, 16, 16, 8};
-        UnaryRepeatParams unaryRepeatParams{1, 1, 16, 8};
+        UnaryRepeatParams unaryRepeatParams{1, 1, 16, 16};
         if (BT_sub_start == 0) {
-            Mul(outFp32, outFp32, tensorMaskA, 64, 64, binaryRepeatParams);
+            Mul(outFp32, outFp32, tensorMaskA, 64, real_BT, binaryRepeatParams);
             PipeBarrier<PIPE_V>();
-            Muls(outFp32[64], outFp32[64], static_cast<float>(0), 64, 64, unaryRepeatParams);
+            Muls(outFp32[64], outFp32[64], static_cast<float>(0), 64, real_BT, unaryRepeatParams);
+            PipeBarrier<PIPE_V>();
         } else {
-            Mul(outFp32[64], outFp32[64], tensorMaskA, 64, 64, binaryRepeatParams);
+            Muls(outFp32, outFp32, scale, 64, real_BT, unaryRepeatParams);
+            PipeBarrier<PIPE_V>();
+            Mul(outFp32[64], outFp32[64], tensorMaskA, 64, real_BT, binaryRepeatParams);
+            PipeBarrier<PIPE_V>();
         }
-        PipeBarrier<PIPE_V>();
     }
 #endif
-    inQue3.FreeTensor(tensorGIn);
 }
 
 // ============== A_vector: Part1 (dw 取负 + dg_last) ==============
@@ -540,28 +519,43 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessBVect
 
             {
                 auto tensorDsIn = inQue1.AllocTensor<DataType>();
+                auto tensorGIn = inQue3.AllocTensor<GType>();
                 DataCopy(tensorDsIn[BT * BT], gmDsTemp[dsOffset], actual_dsSize);
+                if constexpr (std::is_same<GType, float>::value) {
+                    CopyGateWithPad(tensorGIn, gmG, gOffset, real_BT, BT);
+                } else {
+                    CopyGateWithPad(tensorGIn[BT], gmG, gOffset, real_BT, BT);
+                }
                 inQue1.EnQue(tensorDsIn);
+                inQue3.EnQue(tensorGIn);
             }
             {
                 auto tensorDsInFp16 = inQue1.DeQue<DataType>();
                 auto tensorDsInFp32 = tensorDsInFp16.template ReinterpretCast<float>();
+                auto tensorGIn = inQue3.DeQue<GType>();
+                auto tensorGFp32Left = tensorGIn.template ReinterpretCast<float>();
                 auto tensorDsTempOut = outQue1.AllocTensor<DataType>();
                 auto tensorDgOut = outQue2.AllocTensor<float>();
 
                 Cast(tensorDsInFp32, tensorDsInFp16[BT * BT], RoundMode::CAST_NONE, actual_dsSize);
+                if constexpr (!std::is_same<GType, float>::value) {
+                    Cast(tensorGFp32Left, tensorGIn[BT], RoundMode::CAST_NONE, BT);
+                }
+                PipeBarrier<PIPE_V>();
 
                 // mul1 从 g 内联算两个 row-half, 写入 inQue2 buffer (fp32)。
                 auto tensorMul1InFp32 = inQue2.AllocTensor<float>();
-                uint32_t vec0 = (real_BT >= half_BT) ? half_BT : real_BT;
-                uint32_t vec1 = (real_BT > vec0) ? (real_BT - vec0) : 0;
-                ComputeMul1HalfFp32(tensorMul1InFp32, tensorMaskA, tensorBrcbTemp, tensorGFp32Right, gOffset, 0, vec0, real_BT);
+                uint32_t vec0 = (real_BT >= 64) ? 64 : real_BT;
+                uint32_t vec1 = (real_BT > 64) ? (real_BT - 64) : 0;
+                ComputeMul1HalfFp32(tensorMul1InFp32, tensorMaskA, tensorBrcbTemp, tensorGFp32Left, tensorGFp32Right, gOffset, 0, vec0);
                 if (vec1 > 0) {
-                    ComputeMul1HalfFp32(tensorMul1InFp32[vec0 * BT], tensorMaskA, tensorBrcbTemp, tensorGFp32Right, gOffset, vec0, vec1, real_BT);
+                    ComputeMul1HalfFp32(tensorMul1InFp32[vec0 * BT], tensorMaskA, tensorBrcbTemp, tensorGFp32Left, tensorGFp32Right, gOffset, vec0, vec1);
                 }
                 PipeBarrier<PIPE_V>();
                 // b_ds_temp = b_ds * mul1 (已应用掩码)
                 Mul(tensorDsInFp32, tensorDsInFp32, tensorMul1InFp32, actual_dsSize);
+                PipeBarrier<PIPE_V>();
+                inQue3.FreeTensor(tensorGIn);
                 inQue2.FreeTensor(tensorMul1InFp32);
 
                 // 搬入 mm5, 复用 mul1 空间

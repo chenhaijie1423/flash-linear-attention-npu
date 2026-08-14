@@ -25,9 +25,7 @@ using namespace AscendC::MicroAPI;
 constexpr uint16_t V_LENGTH_FP32 = VECTOR_REG_WIDTH / sizeof(float);
 // 一个 half 寄存器可容纳的元素数 (dav-3510 = 128; bfloat16_t 同为 2 字节, 共用此常量)
 constexpr uint16_t V_LENGTH_HALF = VECTOR_REG_WIDTH / sizeof(half);
-// QKV 16-bit 类型 (half / bfloat16_t) 由 caller 按 DataType 作为 HalfT 模板实参传入;
-// CastHalf2Float<HalfT> / CastFloat2Half<HalfT> 已模板化, ctHalf2Fp32*/ctFp322Half* trait
-// 配置 (ZERO/SAT/ZEROING/CAST_NONE 等) 对 half 与 bfloat16_t 通用 (对照 kda kKdaRegbaseBf16ToFp32)。
+
 
 // ============================================================================
 // P0-1: Mul1Half
@@ -53,58 +51,58 @@ static __simd_vf__ inline void Mul1Half(
     __ubuf__ float *outFp32,       // [realBt, BT_SIZE] row-major 输出 (fp32)
     __ubuf__ float *gFp32,         // [BT_SIZE] gate 已升精度 (caller cast 后)
     __ubuf__ float *maskAddr,      // [64, 64] 下三角 mask, 行 r = maskAddr + r*64
-    uint16_t realBt)               // 有效输出行数
+    uint16_t realBt,               // 有效输出行数
+    float scale)
 {
     RegTensor<float> regGLeft, regSum, regExp, regMask, regOut;
-    MaskReg maskFull = CreateMask<float, MaskPattern::ALL>();
+    MaskReg maskAll = CreateMask<float, MaskPattern::ALL>();
 
     // 一次性载入 g[0..BT-1] 并取负 (-g 在所有行共享)
     if constexpr (BT_SIZE == 64) {
         RegTensor<float> regG, regNegG;
-        LoadIn<float, false>(regG, gFp32);
-        Muls(regNegG, regG, -1.0f, maskFull);
+        LoadAlign<float, PostLiteral::POST_MODE_UPDATE>(regG, gFp32, V_LENGTH_FP32);
+        Muls(regNegG, regG, -1.0f, maskAll);
 
-        for (uint16_t i = 0; i < realBt; ++i) {
-            // gLeft = g[BT_SUB_START + i], 广播到全 lane (DIST_BRC_B32)
-            LoadIn<float, true>(regGLeft, gFp32 + BT_SUB_START + i);
-            Add(regSum, regNegG, regGLeft, maskFull);     // gLeft - g
-            Mins(regSum, regSum, 0.0f, maskFull);
-            Exp(regExp, regSum, maskFull);
-            // mask row = BT_SUB_START + i
-            LoadIn<float, false>(regMask, maskAddr + (BT_SUB_START + i) * 64);
-            Mul(regOut, regExp, regMask, maskFull);
-            StoreAlign(outFp32 + i * BT_SIZE, regOut, maskFull);
+        for (uint16_t i = 0; i < realBt; i++) {
+            // gLeft = g[i], 广播到全 lane (DIST_BRC_B32)
+            LoadAlign<float, LoadDist::DIST_BRC_B32>(regGLeft, gFp32 + i);
+            LoadAlign<float, PostLiteral::POST_MODE_UPDATE>(regMask, maskAddr, V_LENGTH_FP32);
+            Add(regSum, regNegG, regGLeft, maskAll);     // gLeft - g
+            Mins(regSum, regSum, 0.0f, maskAll);
+            Exp(regExp, regSum, maskAll);
+            // mask row = i
+            Mul(regOut, regExp, regMask, maskAll);
+            StoreAlign<float, PostLiteral::POST_MODE_UPDATE>(outFp32, regOut, V_LENGTH_FP32, maskAll);
         }
     } else {
         // BT_SIZE == 128: g 分两个 64 元素半段
         RegTensor<float> regG0, regG1, regNegG0, regNegG1;
         RegTensor<float> regSum1, regExp1, regOut1;
-        LoadIn<float, false>(regG0, gFp32);
-        LoadIn<float, false>(regG1, gFp32 + 64);
-        Muls(regNegG0, regG0, -1.0f, maskFull);
-        Muls(regNegG1, regG1, -1.0f, maskFull);
+        LoadAlign<float, PostLiteral::POST_MODE_UPDATE>(regG0, gFp32, V_LENGTH_FP32);
+        LoadAlign<float, PostLiteral::POST_MODE_UPDATE>(regG1, gFp32, V_LENGTH_FP32);
+        Muls(regNegG0, regG0, -1.0f, maskAll);
+        Muls(regNegG1, regG1, -1.0f, maskAll);
 
-        for (uint16_t i = 0; i < realBt; ++i) {
-            LoadIn<float, true>(regGLeft, gFp32 + BT_SUB_START + i);
-            // 前半 cols[0..63]
-            Add(regSum, regNegG0, regGLeft, maskFull);
-            Mins(regSum, regSum, 0.0f, maskFull);
-            Exp(regExp, regSum, maskFull);
-            // 后半 cols[64..127]
-            Add(regSum1, regNegG1, regGLeft, maskFull);
-            Mins(regSum1, regSum1, 0.0f, maskFull);
-            Exp(regExp1, regSum1, maskFull);
+        for (uint16_t i = 0; i < realBt; i++) {
+            LoadAlign<float, LoadDist::DIST_BRC_B32>(regGLeft, gFp32 + BT_SUB_START + i);
+            Add(regSum, regNegG0, regGLeft, maskAll);
+            Add(regSum1, regNegG1, regGLeft, maskAll);
+            Mins(regSum, regSum, 0.0f, maskAll);
+            Mins(regSum1, regSum1, 0.0f, maskAll);
+            Exp(regExp, regSum, maskAll);
+            Exp(regExp1, regSum1, maskAll);
             // mask (row = i): BT_SUB_START==0 -> 前半 mask / 后半置 0;
-            //                 BT_SUB_START==64 -> 前半保留 / 后半 mask
-            LoadIn<float, false>(regMask, maskAddr + i * 64);
+            //                 BT_SUB_START==64 -> 前半 * scale / 后半 mask
+            LoadAlign<float, PostLiteral::POST_MODE_UPDATE>(regMask, maskAddr, V_LENGTH_FP32);
             if constexpr (BT_SUB_START == 0) {
-                Mul(regOut, regExp, regMask, maskFull);
-                Duplicate(regOut1, 0.0f);       // 后半置 0 (scale*0=0)
+                Mul(regOut, regExp, regMask, maskAll);
+                Muls(regOut1, regExp1, 0.0f, maskAll);
             } else {
-                Mul(regOut1, regExp1, regMask, maskFull);
+                Muls(regOut, regExp, scale, maskAll);
+                Mul(regOut1, regExp1, regMask, maskAll);
             }
-            StoreAlign(outFp32 + i * BT_SIZE, regOut, maskFull);
-            StoreAlign(outFp32 + i * BT_SIZE + 64, regOut1, maskFull);
+            StoreAlign<float, PostLiteral::POST_MODE_UPDATE>(outFp32, regOut, V_LENGTH_FP32, maskAll);
+            StoreAlign<float, PostLiteral::POST_MODE_UPDATE>(outFp32, regOut1, V_LENGTH_FP32, maskAll);
         }
     }
 }
