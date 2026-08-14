@@ -306,6 +306,25 @@ public:
         }
     };
 
+    // Global Tensors
+    GlobalTensor<ElementA> gmQ;
+    GlobalTensor<ElementA> gmK;
+    GlobalTensor<ElementA> gmV;
+    GlobalTensor<ElementA> gmH;
+    GlobalTensor<ElementA> gmDo;
+    GlobalTensor<ElementA> gmDh;
+    GlobalTensor<ElementA> gmDv;
+    GlobalTensor<ElementC> gmDq;
+    GlobalTensor<ElementC> gmDk;
+    GlobalTensor<ElementC> gmDw;
+    GlobalTensor<ElementC> gmDs;
+    GlobalTensor<ElementA> gmDsTemp;
+    GlobalTensor<ElementC> gmMm5;
+    GlobalTensor<ElementC> gmMm6;
+    GlobalTensor<ElementC> gmMm7;
+    GlobalTensor<uint64_t> cuSeqlensTensor;
+    GlobalTensor<uint64_t> chunkIndicesTensor;
+
     CATLASS_DEVICE
     ChunkBwdDqkwgTla()
     {
@@ -335,7 +354,21 @@ public:
         uint32_t V = static_cast<uint32_t>(params.V);
         const bool gvaMode = params.HV != params.HK;
 
-        GlobalTensor<uint64_t> cuSeqlensTensor, chunkIndicesTensor;
+        gmQ.SetGlobalBuffer((__gm__ ElementA *)params.ptrQ);
+        gmK.SetGlobalBuffer((__gm__ ElementA *)params.ptrK);
+        gmV.SetGlobalBuffer((__gm__ ElementA *)params.ptrV);
+        gmH.SetGlobalBuffer((__gm__ ElementA *)params.ptrH);
+        gmDo.SetGlobalBuffer((__gm__ ElementA *)params.ptrDo);
+        gmDh.SetGlobalBuffer((__gm__ ElementA *)params.ptrDh);
+        gmDv.SetGlobalBuffer((__gm__ ElementA *)params.ptrDv);
+        gmDq.SetGlobalBuffer((__gm__ ElementC *)params.ptrDq);
+        gmDk.SetGlobalBuffer((__gm__ ElementC *)params.ptrDk);
+        gmDw.SetGlobalBuffer((__gm__ ElementC *)params.ptrDw);
+        gmDs.SetGlobalBuffer((__gm__ ElementC *)((__gm__ uint8_t *)params.ptrWorkspace + params.wsDsTempOffset));
+        gmDsTemp.SetGlobalBuffer((__gm__ ElementA *)((__gm__ uint8_t *)params.ptrWorkspace + params.wsDsTempOffset));
+        gmMm5.SetGlobalBuffer((__gm__ ElementC *)((__gm__ uint8_t *)params.ptrWorkspace + params.wsMm5Offset));
+        gmMm6.SetGlobalBuffer((__gm__ ElementC *)((__gm__ uint8_t *)params.ptrWorkspace + params.wsMm6Offset));
+        gmMm7.SetGlobalBuffer((__gm__ ElementC *)((__gm__ uint8_t *)params.ptrWorkspace + params.wsMm7Offset));
         if (params.isVarLen) {
             cuSeqlensTensor.SetGlobalBuffer((__gm__ uint64_t *)params.ptrCuSeqLens);
             chunkIndicesTensor.SetGlobalBuffer((__gm__ uint64_t *)params.ptrChunkIndices);
@@ -387,16 +420,9 @@ public:
                     // dw 写 short 环槽 (深度自适应 2G-1, 贴 L2): 偏移由 (coreIdx,loopIdx,coreNum,h) 算出
                     uint64_t dwOffset = (h * params.T + bos) * params.K;
 
-                    GlobalTensor<ElementA> gmDv;
-                    gmDv.SetGlobalBuffer((__gm__ ElementA *)params.ptrDv + dvOffset);
-                    GlobalTensor<ElementA> gmH;
-                    gmH.SetGlobalBuffer((__gm__ ElementA *)params.ptrH + hOffset);
-                    GlobalTensor<ElementC> gmDw;
-                    gmDw.SetGlobalBuffer((__gm__ ElementC *)params.ptrDw + dwOffset);
-
-                    auto tensorDv = tla::MakeTensor(gmDv, MakeLayoutFromTag(layoutBTxV), Arch::PositionGM{});
-                    auto tensorH = tla::MakeTensor(gmH, MakeLayoutFromTag(layoutVxK), Arch::PositionGM{}); // h^T
-                    auto tensorDw = tla::MakeTensor(gmDw, MakeLayoutFromTag(layoutBTxK), Arch::PositionGM{});
+                    auto tensorDv = tla::MakeTensor(gmDv[dvOffset], MakeLayoutFromTag(layoutBTxV), Arch::PositionGM{});
+                    auto tensorH = tla::MakeTensor(gmH[hOffset], MakeLayoutFromTag(layoutVxK), Arch::PositionGM{}); // h^T
+                    auto tensorDw = tla::MakeTensor(gmDw[dwOffset], MakeLayoutFromTag(layoutBTxK), Arch::PositionGM{});
 
                     auto tensorBlockDv = GetTile(tensorDv, tla::MakeCoord(0, 0),
                                                     tla::MakeShape(actualBlockShape1.m(), actualBlockShape1.k()));
@@ -417,18 +443,9 @@ public:
                         DqkwgBtxKRingElemOffset(coreIdx, loopBase, loopIdx, coreNum, h, params.HV, params.BT,
                                                 params.K, groupRingDepth);
 
-                    GlobalTensor<ElementA> gmQ;
-                    gmQ.SetGlobalBuffer((__gm__ ElementA *)params.ptrQ + qkOffset);
-                    GlobalTensor<ElementA> gmK;
-                    gmK.SetGlobalBuffer((__gm__ ElementA *)params.ptrK + qkOffset);
-                    GlobalTensor<ElementC> gmMm5;
-                    gmMm5.SetGlobalBuffer(
-                        (__gm__ ElementC *)((__gm__ uint8_t *)params.ptrWorkspace + params.wsMm5Offset) +
-                        mm5Offset);
-
-                    auto tensorQ = tla::MakeTensor(gmQ, MakeLayoutFromTag(layoutBTxK), Arch::PositionGM{});
-                    auto tensorK = tla::MakeTensor(gmK, MakeLayoutFromTag(layoutKxBT), Arch::PositionGM{}); // k^T
-                    auto tensorMm5 = tla::MakeTensor(gmMm5, MakeLayoutFromTag(layoutBTxBT), Arch::PositionGM{});
+                    auto tensorQ = tla::MakeTensor(gmQ[qkOffset], MakeLayoutFromTag(layoutBTxK), Arch::PositionGM{});
+                    auto tensorK = tla::MakeTensor(gmK[qkOffset], MakeLayoutFromTag(layoutKxBT), Arch::PositionGM{}); // k^T
+                    auto tensorMm5 = tla::MakeTensor(gmMm5[mm5Offset], MakeLayoutFromTag(layoutBTxBT), Arch::PositionGM{});
 
                     auto tensorBlockQ = GetTile(tensorQ, tla::MakeCoord(0, 0),
                                                 tla::MakeShape(actualBlockShape2.m(), actualBlockShape2.k()));
@@ -447,17 +464,9 @@ public:
                     uint64_t dsOffset = DqkwgBtbRingElemOffset(coreIdx, loopBase, loopIdx, coreNum, h, params.HV,
                                                             params.BT, groupRingDepth);
 
-                    GlobalTensor<ElementA> gmDo;
-                    gmDo.SetGlobalBuffer((__gm__ ElementA *)params.ptrDo + dvOffset);
-                    GlobalTensor<ElementA> gmV;
-                    gmV.SetGlobalBuffer((__gm__ ElementA *)params.ptrV + dvOffset);
-                    GlobalTensor<ElementC> gmDs;
-                    gmDs.SetGlobalBuffer(
-                        (__gm__ ElementC *)((__gm__ uint8_t *)params.ptrWorkspace + params.wsDsTempOffset) + dsOffset);
-
-                    auto tensorDo = tla::MakeTensor(gmDo, MakeLayoutFromTag(layoutBTxV), Arch::PositionGM{});
-                    auto tensorV = tla::MakeTensor(gmV, MakeLayoutFromTag(layoutVxBT), Arch::PositionGM{}); // v^T
-                    auto tensorDs = tla::MakeTensor(gmDs, MakeLayoutFromTag(layoutBTxBT), Arch::PositionGM{});
+                    auto tensorDo = tla::MakeTensor(gmDo[dvOffset], MakeLayoutFromTag(layoutBTxV), Arch::PositionGM{});
+                    auto tensorV = tla::MakeTensor(gmV[dvOffset], MakeLayoutFromTag(layoutVxBT), Arch::PositionGM{}); // v^T
+                    auto tensorDs = tla::MakeTensor(gmDs[dsOffset], MakeLayoutFromTag(layoutBTxBT), Arch::PositionGM{});
 
                     auto tensorBlockDo = GetTile(tensorDo, tla::MakeCoord(0, 0),
                                                 tla::MakeShape(actualBlockShape3.m(), actualBlockShape3.k()));
@@ -473,20 +482,14 @@ public:
                 for (uint32_t h = 0; h < params.HV; h++) {
                     // --- Part4: dq_inner = do @ h^T ---
                     {
+                        uint32_t hk_idx = h / params.n_ratio;
                         uint64_t doOffset = (h * params.T + bos) * params.V;
                         uint64_t hOffset = ((bIdx * params.HV + h) * params.numChunks + chunkIdx) * params.K * params.V;
-                        uint64_t dqOffset = (h * params.T + bos) * params.K;
+                        uint64_t dqOffset = (hk_idx * params.T + bos_hk) * params.K;
 
-                        GlobalTensor<ElementA> gmDo;
-                        gmDo.SetGlobalBuffer((__gm__ ElementA *)params.ptrDo + doOffset);
-                        GlobalTensor<ElementA> gmH;
-                        gmH.SetGlobalBuffer((__gm__ ElementA *)params.ptrH + hOffset);
-                        GlobalTensor<ElementC> gmDq;
-                        gmDq.SetGlobalBuffer((__gm__ ElementC *)params.ptrDq + dqOffset);
-
-                        auto tensorDo = tla::MakeTensor(gmDo, MakeLayoutFromTag(layoutBTxV), Arch::PositionGM{});
-                        auto tensorH = tla::MakeTensor(gmH, MakeLayoutFromTag(layoutVxK), Arch::PositionGM{});
-                        auto tensorDq = tla::MakeTensor(gmDq, MakeLayoutFromTag(layoutBTxK), Arch::PositionGM{});
+                        auto tensorDo = tla::MakeTensor(gmDo[doOffset], MakeLayoutFromTag(layoutBTxV), Arch::PositionGM{});
+                        auto tensorH = tla::MakeTensor(gmH[hOffset], MakeLayoutFromTag(layoutVxK), Arch::PositionGM{});
+                        auto tensorDq = tla::MakeTensor(gmDq[dqOffset], MakeLayoutFromTag(layoutBTxK), Arch::PositionGM{});
 
                         auto tensorBlockDo = GetTile(tensorDo, tla::MakeCoord(0, 0),
                                                     tla::MakeShape(actualBlockShape4.m(), actualBlockShape4.k()));
@@ -500,30 +503,18 @@ public:
                     }
                     // --- Part6: mm6 = ds_temp @ k -> wsMm6 ---
                     {
-                        uint64_t dsOffset = DqkwgBtbRingElemOffset(coreIdx, loopBase, loopIdx, coreNum, h, params.HV,
-                                                                params.BT, groupRingDepth);
                         // GVA: k 为 HK 头
                         uint32_t hk_idx = h / params.n_ratio;
+                        uint64_t dsOffset = DqkwgBtbRingElemOffset(coreIdx, loopBase, loopIdx, coreNum, h, params.HV,
+                                                                params.BT, groupRingDepth);
                         uint64_t kOffset = (hk_idx * params.T + bos_hk) * params.K;
-
-                        GlobalTensor<ElementA> gmDsTemp;
-                        gmDsTemp.SetGlobalBuffer(
-                            (__gm__ ElementA *)((__gm__ uint8_t *)params.ptrWorkspace + params.wsDsTempOffset) +
-                            dsOffset);
-                        GlobalTensor<ElementA> gmK;
-                        gmK.SetGlobalBuffer((__gm__ ElementA *)params.ptrK + kOffset);
-                        GlobalTensor<ElementC> gmMm6; // mm6 复用 dw short 环区 (stage C 内消费, 与 dw 同槽)
                         uint64_t mm6RingOffset = DqkwgShortBtxKRingElemOffset(
                             coreIdx, loopIdx, coreNum, h, params.HV, params.BT, params.K,
                             shortRingDepth);
-                        gmMm6.SetGlobalBuffer(
-                            (__gm__ ElementC *)((__gm__ uint8_t *)params.ptrWorkspace + params.wsMm6Offset) +
-                            mm6RingOffset);
 
-                        auto tensorDsTemp =
-                            tla::MakeTensor(gmDsTemp, MakeLayoutFromTag(layoutBTxBT), Arch::PositionGM{});
-                        auto tensorK = tla::MakeTensor(gmK, MakeLayoutFromTag(layoutBTxK), Arch::PositionGM{});
-                        auto tensorMm6 = tla::MakeTensor(gmMm6, MakeLayoutFromTag(layoutBTxK), Arch::PositionGM{});
+                        auto tensorDsTemp = tla::MakeTensor(gmDsTemp[dsOffset], MakeLayoutFromTag(layoutBTxBT), Arch::PositionGM{});
+                        auto tensorK = tla::MakeTensor(gmK[kOffset], MakeLayoutFromTag(layoutBTxK), Arch::PositionGM{});
+                        auto tensorMm6 = tla::MakeTensor(gmMm6[mm6RingOffset], MakeLayoutFromTag(layoutBTxK), Arch::PositionGM{});
 
                         auto tensorBlockDsTemp = GetTile(tensorDsTemp, tla::MakeCoord(0, 0),
                                                         tla::MakeShape(actualBlockShape6.m(), actualBlockShape6.k()));
@@ -541,21 +532,14 @@ public:
                 for (uint32_t h = 0; h < params.HV; h++) {
                     // --- Part5: dk_inner = v @ dh ---
                     {
+                        uint32_t hk_idx = h / params.n_ratio;
                         uint64_t vOffset = (h * params.T + bos) * params.V;
-                        uint64_t dhOffset =
-                            ((bIdx * params.HV + h) * params.numChunks + chunkIdx) * params.K * params.V;
-                        uint64_t dkOffset = (h * params.T + bos) * params.K;
+                        uint64_t dhOffset = ((bIdx * params.HV + h) * params.numChunks + chunkIdx) * params.K * params.V;
+                        uint64_t dkOffset = (hk_idx * params.T + bos_hk) * params.K;
 
-                        GlobalTensor<ElementA> gmV;
-                        gmV.SetGlobalBuffer((__gm__ ElementA *)params.ptrV + vOffset);
-                        GlobalTensor<ElementA> gmDh;
-                        gmDh.SetGlobalBuffer((__gm__ ElementA *)params.ptrDh + dhOffset);
-                        GlobalTensor<ElementC> gmDk;
-                        gmDk.SetGlobalBuffer((__gm__ ElementC *)params.ptrDk + dkOffset);
-
-                        auto tensorV = tla::MakeTensor(gmV, MakeLayoutFromTag(layoutBTxV), Arch::PositionGM{});
-                        auto tensorDh = tla::MakeTensor(gmDh, MakeLayoutFromTag(layoutVxK), Arch::PositionGM{});
-                        auto tensorDk = tla::MakeTensor(gmDk, MakeLayoutFromTag(layoutBTxK), Arch::PositionGM{});
+                        auto tensorV = tla::MakeTensor(gmV[vOffset], MakeLayoutFromTag(layoutBTxV), Arch::PositionGM{});
+                        auto tensorDh = tla::MakeTensor(gmDh[dhOffset], MakeLayoutFromTag(layoutVxK), Arch::PositionGM{});
+                        auto tensorDk = tla::MakeTensor(gmDk[dkOffset], MakeLayoutFromTag(layoutBTxK), Arch::PositionGM{});
 
                         auto tensorBlockV = GetTile(tensorV, tla::MakeCoord(0, 0),
                                                     tla::MakeShape(actualBlockShape5.m(), actualBlockShape5.k()));
@@ -569,31 +553,18 @@ public:
                     }
                     // --- Part7: mm7 = ds_temp^T @ q -> wsMm7 (复用 wsMm5) ---
                     {
-                        uint64_t dsOffset = DqkwgBtbRingElemOffset(coreIdx, loopBase, loopIdx, coreNum, h, params.HV,
-                                                                   params.BT, groupRingDepth);
                         // GVA: q 为 HK 头
                         uint32_t hk_idx = h / params.n_ratio;
+                        uint64_t dsOffset = DqkwgBtbRingElemOffset(coreIdx, loopBase, loopIdx, coreNum, h, params.HV,
+                                                                   params.BT, groupRingDepth);
                         uint64_t qOffset = (hk_idx * params.T + bos_hk) * params.K;
-
-                        GlobalTensor<ElementA> gmDsTemp;
-                        gmDsTemp.SetGlobalBuffer(
-                            (__gm__ ElementA *)((__gm__ uint8_t *)params.ptrWorkspace + params.wsDsTempOffset) +
-                            dsOffset);
-                        GlobalTensor<ElementA> gmQ;
-                        gmQ.SetGlobalBuffer((__gm__ ElementA *)params.ptrQ + qOffset);
-                        GlobalTensor<ElementC> gmMm7; // mm7 复用 mm5 的 group 环槽 (stage D 写, mm5 已在 stage B
-                                                      // 消费完; 单写, 同 stride 无跨核冲突)
                         uint64_t mm7RingOffset =
                             DqkwgBtxKRingElemOffset(coreIdx, loopBase, loopIdx, coreNum, h, params.HV, params.BT,
                                                     params.K, groupRingDepth);
-                        gmMm7.SetGlobalBuffer(
-                            (__gm__ ElementC *)((__gm__ uint8_t *)params.ptrWorkspace + params.wsMm7Offset) +
-                            mm7RingOffset);
 
-                        auto tensorDsTemp =
-                            tla::MakeTensor(gmDsTemp, MakeLayoutFromTag(layoutBTxBT_T), Arch::PositionGM{});
-                        auto tensorQ = tla::MakeTensor(gmQ, MakeLayoutFromTag(layoutBTxK), Arch::PositionGM{});
-                        auto tensorMm7 = tla::MakeTensor(gmMm7, MakeLayoutFromTag(layoutBTxK), Arch::PositionGM{});
+                        auto tensorDsTemp =tla::MakeTensor(gmDsTemp[dsOffset], MakeLayoutFromTag(layoutBTxBT_T), Arch::PositionGM{});
+                        auto tensorQ = tla::MakeTensor(gmQ[qOffset], MakeLayoutFromTag(layoutBTxK), Arch::PositionGM{});
+                        auto tensorMm7 = tla::MakeTensor(gmMm7[mm7RingOffset], MakeLayoutFromTag(layoutBTxK), Arch::PositionGM{});
 
                         auto tensorBlockDsTemp = GetTile(tensorDsTemp, tla::MakeCoord(0, 0),
                                                          tla::MakeShape(actualBlockShape7.m(), actualBlockShape7.k()));

@@ -31,10 +31,10 @@ constexpr uint16_t V_LENGTH_HALF = VECTOR_REG_WIDTH / sizeof(half);
 
 // ============================================================================
 // P0-1: Mul1Half
-//   out[i][j] = scale * mask[i][j] * exp(min(0, g[BT_SUB_START+i] - g[j]))
+//   out[i][j] = mask[i][j] * exp(min(0, g[BT_SUB_START+i] - g[j]))
 //
 // 调用方需先完成 g 的 GType->fp32 cast (保留 MemBase, 1 条指令), 将 fp32 g 指针
-// 传入; Muls(-1)/Brcb/strided-Add/Mins/Exp/Mul(mask)/Muls(scale) 全部下沉到本 VF。
+// 传入; Muls(-1)/Brcb/strided-Add/Mins/Exp/Mul(mask)/ 全部下沉到本 VF。
 //
 // mask 布局 (与 vector.h gBuf 64x64 下三角一致):
 //   BT==64 : out[i][0..63], mask row = BT_SUB_START + i  (causal col j <= BT_SUB_START+i)
@@ -53,12 +53,10 @@ static __simd_vf__ inline void Mul1Half(
     __ubuf__ float *outFp32,       // [realBt, BT_SIZE] row-major 输出 (fp32)
     __ubuf__ float *gFp32,         // [BT_SIZE] gate 已升精度 (caller cast 后)
     __ubuf__ float *maskAddr,      // [64, 64] 下三角 mask, 行 r = maskAddr + r*64
-    uint16_t realBt,               // 有效输出行数
-    float scale)
+    uint16_t realBt)               // 有效输出行数
 {
-    RegTensor<float> regGLeft, regSum, regExp, regMask, regOut, scaleReg;
+    RegTensor<float> regGLeft, regSum, regExp, regMask, regOut;
     MaskReg maskFull = CreateMask<float, MaskPattern::ALL>();
-    Duplicate(scaleReg, scale);
 
     // 一次性载入 g[0..BT-1] 并取负 (-g 在所有行共享)
     if constexpr (BT_SIZE == 64) {
@@ -75,7 +73,6 @@ static __simd_vf__ inline void Mul1Half(
             // mask row = BT_SUB_START + i
             LoadIn<float, false>(regMask, maskAddr + (BT_SUB_START + i) * 64);
             Mul(regOut, regExp, regMask, maskFull);
-            Mul(regOut, regOut, scaleReg, maskFull);
             StoreAlign(outFp32 + i * BT_SIZE, regOut, maskFull);
         }
     } else {
@@ -102,12 +99,9 @@ static __simd_vf__ inline void Mul1Half(
             LoadIn<float, false>(regMask, maskAddr + i * 64);
             if constexpr (BT_SUB_START == 0) {
                 Mul(regOut, regExp, regMask, maskFull);
-                Mul(regOut, regOut, scaleReg, maskFull);
                 Duplicate(regOut1, 0.0f);       // 后半置 0 (scale*0=0)
             } else {
-                Mul(regOut, regExp, scaleReg, maskFull);  // 前半保留, 仅 scale
                 Mul(regOut1, regExp1, regMask, maskFull);
-                Mul(regOut1, regOut1, scaleReg, maskFull);
             }
             StoreAlign(outFp32 + i * BT_SIZE, regOut, maskFull);
             StoreAlign(outFp32 + i * BT_SIZE + 64, regOut1, maskFull);
