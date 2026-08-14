@@ -40,6 +40,21 @@ import pickle
 import math
 import sys
 
+def compare_data(golden_out, npu_out, threshold):
+    a = golden_out.cpu().reshape(1, golden_out.numel())[0]
+    b = npu_out.cpu().reshape(1, npu_out.numel())[0]
+    diff = torch.abs(a - b) / torch.max(torch.abs(a), torch.tensor(1))
+
+    max_diff, max_index = torch.max(diff, dim = 0)
+    c = max_diff < threshold
+    print("阈值为：", threshold)
+    print("最大误差为：", max_diff.item(), "，位于索引：", max_index.item())
+    print("两个值：", a[max_index.item()], b[max_index.item()])
+    if c==False:
+        print("test case fail")
+    else:
+        print("test case ok")
+
 def prepare_lens(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
     return cu_seqlens[1:] - cu_seqlens[:-1]
 
@@ -97,7 +112,6 @@ def prepare_chunk_indices(
             
     return indices
 
-
 def chunk_bwd_dqkwg_cpu(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -111,45 +125,56 @@ def chunk_bwd_dqkwg_cpu(
     scale: float,
     cu_seqlens: torch.LongTensor,
     chunk_size: int = 64,
+    benchmark = False
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     CPU Equivalent of chunk_bwd_kernel_dqkwg.
     """
-    q.to(torch.float32)
-    k.to(torch.float32)
-    v.to(torch.float32)
-    do.to(torch.float32)
-    h.to(torch.float32)
-    dh.to(torch.float32)
-    w.to(torch.float32)
-    g.to(torch.float32)
-    dv.to(torch.float32)
-    B, T, H, K = q.shape
+    if benchmark:
+        calc_type = torch.float64
+    else:
+        calc_type = torch.float32
+    q.to(calc_type)
+    k.to(calc_type)
+    v.to(calc_type)
+    do.to(calc_type)
+    h.to(calc_type)
+    dh.to(calc_type)
+    
+    g.to(calc_type)
+    dv.to(calc_type)
+    B, T, HK, K = q.shape
+    HV = v.shape[2]
     V = v.shape[-1]
+    if HK <= 0 or HV <= 0 or HV % HK != 0:
+        raise ValueError(f"GVA requires HV divisible by HK, got HV={HV}, HK={HK}")
+    n_ratio = HV // HK  # HV = n_ratio * HK
     datatype = q.dtype
     gtype = g.dtype
-    calctype = torch.float32
+    if benchmark:
+        datatype = torch.float64
+        gtype = torch.float64
     g_gamma = None
-    print(f"h {h.dtype}")
     
-    dq = torch.zeros_like(q)
-    dk = torch.zeros_like(k)
+    # Keep per-value-head contributions first, then reduce them into key heads.
+    dq_hv = torch.zeros((B, T, HV, K), dtype=datatype)
+    dk_hv = torch.zeros((B, T, HV, K), dtype=datatype)
     dg = torch.zeros_like(g) if g is not None else None
-    dw = torch.zeros_like(w) if w is not None else None
+    dw = torch.zeros((B, T, HV, K), dtype=datatype)
+    w = torch.zeros((B, T, HV, K), dtype=datatype)
+
     
     # 辅助函数：处理单个序列的逻辑
     def process_sequence(b_idx, t_start, t_end, seq_idx_in_batch, chunk_start_idx):
         # 计算该序列有多少个块
         seq_len = t_end - t_start
         num_chunks = (seq_len + chunk_size - 1) // chunk_size
-        # print(f"seq_len {seq_len} = {t_end} - {t_start}")
-        # print(f"num_chunks {num_chunks} = ({seq_len} + {chunk_size} - 1) // {chunk_size}")
-        print("H(head)", H, "b_idx", b_idx, "t_start", t_start, "t_end", t_end, "seq_idx_in_batch", seq_idx_in_batch, "chunk_start_idx", chunk_start_idx)
-        #last_unaligned_chunk = seq_len - num_chunks * chunk_size
-        #first_chunk_location = chunk_start_idx#(t_start + chunk_size -1) // chunk_size  ##首chunk的位置
-        #print()
+        # print("H(head)", H, "num_chunks", num_chunks, "b_idx", b_idx, "t_start", t_start, "t_end", t_end, "seq_idx_in_batch", seq_idx_in_batch, "chunk_start_idx", chunk_start_idx)
+
         
-        for h_idx in range(H):
+        for h_idx in range(HV):
+            # h_idx is hv_idx; compute hk_idx for q/k access
+            hk_idx = h_idx // n_ratio
             # 获取当前头的 gamma (如果 USE_G_GAMMA)
             gamma_val = None
             if g_gamma is not None:
@@ -160,9 +185,7 @@ def chunk_bwd_dqkwg_cpu(
                 chunk_start_token_idx = t_start + i_t * chunk_size
                 chunk_end_token_idx = min(t_start + (i_t + 1) * chunk_size, t_end)
                 actual_chunk_len = chunk_end_token_idx - chunk_start_token_idx
-                # print(f"  h_idx {h_idx} i_t {i_t} chunk_start_token_idx {chunk_start_token_idx} chunk_end_token_idx {chunk_end_token_idx} actual_chunk_len {actual_chunk_len}")
-                #if (i_t == num_chunks - 1): #最后一个chunk
-                
+
                 # 当前块在 h/dh 中的索引 (NT 维度)
                 # Triton 代码逻辑: i_tg = i_b * NT + i_t (定长) 或 i_t (变长且 chunk_indices 处理)
                 # 这里我们假设 h 形状为 (B, H, NT, K, V) 或者兼容的扁平结构。
@@ -171,41 +194,37 @@ def chunk_bwd_dqkwg_cpu(
                 
                 # 切片当前块的数据
                 
-                q_c = q[b_idx, chunk_start_token_idx:chunk_end_token_idx, h_idx, :]  # [BT, K]
-                k_c = k[b_idx, chunk_start_token_idx:chunk_end_token_idx, h_idx, :]  # [BT, K]
+                q_c = q[b_idx, chunk_start_token_idx:chunk_end_token_idx, hk_idx, :]  # [BT, K]
+                k_c = k[b_idx, chunk_start_token_idx:chunk_end_token_idx, hk_idx, :]  # [BT, K]
+
                 v_c = v[b_idx, chunk_start_token_idx:chunk_end_token_idx, h_idx, :]  # [BT, V]
                 do_c = do[b_idx, chunk_start_token_idx:chunk_end_token_idx, h_idx, :] # [BT, V]
-                #print(f"q_c {q_c.dtype} = q[{b_idx}, {chunk_start_token_idx}:{chunk_end_token_idx}, {h_idx}, :], {q.dtype}")
-                
+
                 # 获取状态 (h_prev) 和 状态梯度 (dh_curr)
                 # h[..., i_t, ...] 存储的是第 i_t 块之前的状态 (即第 i_t-1 块的输出)
+                # print("\th ", h.shape, f"h[{b_idx}, {i_t} + {chunk_start_idx}, {h_idx}, :, :]")
                 h_prev = h[b_idx, i_t + chunk_start_idx, h_idx, :, :]  # [K, V]  ## 不对齐的情况??
                 dh_curr = dh[b_idx, i_t + chunk_start_idx, h_idx, :, :] # [K, V]
-                #print(f"h[{b_idx}, {i_t+t_start//chunk_size}, {h_idx}, :, :],{h.shape}, {h.dtype}, {h_prev.dtype}")
 
                 # -----------------------------------------------------------
                 # 1. State Contributions (Inter-chunk)
                 # -----------------------------------------------------------
                 # Triton: b_dq += dot(b_do, b_h) -> do @ h_prev.T
                 # h_prev 是 [K, V], do_c 是 [BT, V] -> [BT, K]
-                dq_from_state = do_c.to(torch.float32) @ h_prev.transpose(-1, -2).to(torch.float32)
+                dq_from_state = do_c.to(calc_type) @ h_prev.transpose(-1, -2).to(calc_type)
 
-                dq_from_state = dq_from_state.to(datatype).to(torch.float32)
+                dq_from_state = dq_from_state.to(datatype).to(calc_type)
 
                 # Triton: b_dk += dot(b_v, b_dh) -> v @ dh_curr.T
                 # dh_curr 是 [K, V], v_c 是 [BT, V] -> [BT, K]
-                dk_from_state = v_c.to(torch.float32) @ dh_curr.transpose(-1, -2).to(torch.float32)
-                dk_from_state = dk_from_state.to(datatype).to(torch.float32)
+                dk_from_state = v_c.to(calc_type) @ dh_curr.transpose(-1, -2).to(calc_type)
+                dk_from_state = dk_from_state.to(datatype).to(calc_type)
                 # Triton: if USE_DW -> b_dw += dot(b_dv, b_h)
                 if w is not None and dv is not None:
                     dv_c = dv[b_idx, chunk_start_token_idx:chunk_end_token_idx, h_idx, :] # [BT, V]
                     # dw_c: [BT, K]
-                    dw_c_val = dv_c.to(torch.float32) @ h_prev.transpose(-1, -2).to(torch.float32)
-                    dw_c_val = dw_c_val.to(datatype).to(torch.float32)
-
-
-
-
+                    dw_c_val = dv_c.to(calc_type) @ h_prev.transpose(-1, -2).to(calc_type)
+                    dw_c_val = dw_c_val.to(datatype).to(calc_type)
                     # Triton stores -b_dw
                     dw[b_idx, chunk_start_token_idx:chunk_end_token_idx, h_idx, :] = -dw_c_val
 
@@ -220,28 +239,18 @@ def chunk_bwd_dqkwg_cpu(
                     
                     # Triton: b_dg_last += sum(h * dh)
                     dg_last_accum = (h_prev * dh_curr).sum()
-                    # print("add4 tensorDgFinal.GetValue(0) = ", dg_last_accum, "* ",torch.exp(g_last))
-                    # print(f"dg_last_accum = (h_prev * dh_curr).sum() {(h_prev * dh_curr).sum()} * torch.exp(g_last) {torch.exp(g_last)}")
+
                     dg_last_accum = dg_last_accum * torch.exp(g_last)
                     # Apply decay to state contributions
 
-                    # print("dq_from_state before",dq_from_state)
-                    # print("g_c",g_c)
-                    # print("torch.exp(g_c)[:, None]",torch.exp(g_c)[:, None])
                     dq_from_state = dq_from_state * torch.exp(g_c)[:, None] * scale
-                    
-
-
-                    # print("-g_c ", -g_c)
-                    # print("-g_c + g_last",g_last, -g_c + g_last)
-                    # print("torch.exp(-g_c + g_last)[:, None] before ", torch.exp(-g_c + g_last)[:, None])
                     dk_from_state = dk_from_state * torch.exp(-g_c + g_last)[:, None]
 
                     # Accumulate gradients into dg (from state terms)
                     # b_dg += sum(b_dq * b_q)
                     dg_c = (dq_from_state * q_c).sum(dim=-1)
-                    # print("ADD0.A", dg_c.to(datatype).to(torch.float32))
-                    dg_c = dg_c.to(datatype).to(torch.float32)         #ADD0.A
+                    # print("ADD0.A", dg_c.to(datatype).to(calc_type))
+                    dg_c = dg_c.to(datatype).to(calc_type)         #ADD0.A
 
                     # b_dg -= sum(b_k * b_dk)
                     dg_c -= (k_c * dk_from_state).sum(dim=-1)           #ADD0.B
@@ -249,11 +258,12 @@ def chunk_bwd_dqkwg_cpu(
                     # print("dk_from_state",dk_from_state)
                     # print("k_c * dk_from_state",( k_c * dk_from_state)[0])
                     # print("Add0.B", -(k_c * dk_from_state).sum(dim=-1))
-                    dg_c = dg_c.to(datatype).to(torch.float32)
+                    dg_c = dg_c.to(datatype).to(calc_type)
 
                     # b_dg_last += sum(b_dk * b_k)
                     # print(f"dg_last_accum {dg_last_accum} += (dk_from_state * k_c).sum() {(dk_from_state * k_c).sum()}")
-                    # print("add4+(dk_from_state * k_c).sum()", (dk_from_state * k_c).sum())
+                    # if h_idx == 0 and i_t == 31:
+                    #     print("     sum0 result", (dk_from_state * k_c).sum())
                     dg_last_accum += (dk_from_state * k_c).sum()
                     # print("dg_last_accum += (dk_from_state * k_c).sum()", dg_last_accum)
                     # pause()
@@ -280,8 +290,8 @@ def chunk_bwd_dqkwg_cpu(
                 # -----------------------------------------------------------
                 # 3. Intra-chunk Attention
                 # -----------------------------------------------------------
-                ds = do_c.to(torch.float32) @ v_c.transpose(-1, -2).to(torch.float32) # [BT, BT]
-                ds = ds.to(datatype).to(torch.float32)
+                ds = do_c.to(calc_type) @ v_c.transpose(-1, -2).to(calc_type) # [BT, BT]
+                ds = ds.to(datatype).to(calc_type)
 
                 
                 # Causal Mask
@@ -304,8 +314,8 @@ def chunk_bwd_dqkwg_cpu(
                     
                     # DG Calculation Part 2 (Intra-chunk)
                     # b_ds2 = b_ds * (q @ k.T)
-                    qk_t = q_c.to(torch.float32) @ k_c.transpose(-1, -2).to(torch.float32)
-                    qk_t = qk_t.to(datatype).to(torch.float32)
+                    qk_t = q_c.to(calc_type) @ k_c.transpose(-1, -2).to(calc_type)
+                    qk_t = qk_t.to(datatype).to(calc_type)
 
 
                     ds2 = ds * qk_t
@@ -331,7 +341,6 @@ def chunk_bwd_dqkwg_cpu(
                     # 这里的 dg_c 仅仅是该位置的梯度 contribution。
                     # 为了完全匹配 Triton 的输出，我们需要把 dg_last_accum 加到块的最后。
                     if actual_chunk_len > 0:
-                        # print("dg_c[-1] before", dg_c[-1])
                         dg_c[actual_chunk_len - 1] += dg_last_accum.to(gtype)  ## 实际上是is_last_mask
 
                     #     print(f"dg_c[{actual_chunk_len - 1}] += {dg_last_accum}")
@@ -360,14 +369,14 @@ def chunk_bwd_dqkwg_cpu(
                 # -----------------------------------------------------------
                 # dq += ds @ k
 
-                dq_intra = ds.to(torch.float32) @ k_c.to(torch.float32)
+                dq_intra = ds.to(calc_type) @ k_c.to(calc_type)
                 # if h_idx == 0 and i_t == 7:
                 #     print("ds.to(torch.float32)",ds.to(torch.float32))
                 #     print("k_c.to(torch.float32)",k_c.to(torch.float32))
-                dq_intra = dq_intra.to(datatype).to(torch.float32)
+                dq_intra = dq_intra.to(datatype).to(calc_type)
                 # dk += ds.T @ q
-                dk_intra = ds.transpose(-1, -2).to(torch.float32) @ q_c.to(torch.float32)
-                dk_intra = dk_intra.to(datatype).to(torch.float32)
+                dk_intra = ds.transpose(-1, -2).to(calc_type) @ q_c.to(calc_type)
+                dk_intra = dk_intra.to(datatype).to(calc_type)
 
                 
                 if g is None and g_gamma is None:
@@ -388,15 +397,8 @@ def chunk_bwd_dqkwg_cpu(
                     # print(h_idx,i_t,"dk_total",dk_total)
 
 
-                dq[b_idx, chunk_start_token_idx:chunk_end_token_idx, h_idx, :] = dq_total
-                dk[b_idx, chunk_start_token_idx:chunk_end_token_idx, h_idx, :] = dk_total
-
-                if RANDOM_DATA == False:
-                    pass
-                    if h_idx == 0 and i_t == 7:
-                        pass
-                        # pause()
-                # exit()
+                dq_hv[b_idx, chunk_start_token_idx:chunk_end_token_idx, h_idx, :] = dq_total.to(datatype)
+                dk_hv[b_idx, chunk_start_token_idx:chunk_end_token_idx, h_idx, :] = dk_total.to(datatype)      
 
     # Main Loop
     if cu_seqlens is None:
@@ -441,6 +443,9 @@ def chunk_bwd_dqkwg_cpu(
                 # 简化起见，我们假设 input 是 packed flat tensor 如果 cu_seqlens 存在。
                 pass 
 
+    dq = dq_hv.view(B, T, HK, n_ratio, K).sum(dim=3).to(datatype)
+    dk = dk_hv.view(B, T, HK, n_ratio, K).sum(dim=3).to(datatype)
+
     return dq, dk, dw, dg
 
 # -------------------------------------------------------------------------
@@ -461,35 +466,35 @@ if __name__ == "__main__":
     isVarLen = False
     chunk_size = 128
     cases = [   #B,H,T,chunk_size,dtype,Gtype,scale,cu_seqlens
-        [64,8,1024,64,torch.float16,torch.float16,0.088,None],
-        [32,16,2048,64,torch.bfloat16,torch.bfloat16,0.0625,None],
-        [16,32,4096,64,torch.float16,torch.float16,0.0442,None],
-        [8,32,8192,64,torch.bfloat16,torch.bfloat16,0.03125,None],
-        [128,4,1024,64,torch.float16,torch.float16,0.088,None],
-        [64,4,4096,128,torch.bfloat16,torch.bfloat16,0.0625,None],
-        [32,16,8192,64,torch.float16,torch.float16,0.0442,None],
-        [16,32,16384,64,torch.bfloat16,torch.bfloat16,0.03125,None],
-        [64,8,2048,128,torch.float16,torch.float16,0.0625,None],
-        [32,16,4096,128,torch.bfloat16,torch.bfloat16,0.0442,None],
-        [16,32,8192,128,torch.float16,torch.float16,0.03125,None],
-        [8,32,8192,128,torch.bfloat16,torch.bfloat16,0.0221,None],  #C12
-        [1,4,1024,64,torch.float16,torch.float16,0.088,None],
-        [48,8,2048,64,torch.bfloat16,torch.bfloat16,0.0625,None],
-        [24,16,4096,64,torch.float16,torch.float16,0.0442,None],
-        [12,32,8192,64,torch.bfloat16,torch.bfloat16,0.03125,None],
-        [1,16,32768,64,torch.float16,torch.float32,0.0625,torch.tensor([0,16,20000,30000,32768])],      # V1
-        [1,8,65536,64,torch.bfloat16,torch.bfloat16,0.0625,torch.tensor([0,16,20000,65536])],
-        [1,32,65536,64,torch.float16,torch.float32,0.0442,torch.tensor([0,16,20000,50000,65536])],
-        [1,32,262144,64,torch.bfloat16,torch.bfloat16,0.03125,torch.tensor([0,16,20000,50000,65536,210000,262144])],
-        [2,4,512,64,torch.bfloat16,torch.float32,0.088,None],  #21 [0,16,128] [0,16,135,512]
-        [1,32,16384,64,torch.bfloat16,torch.float32,0.088,None],  #21 [0,16,128]
+        [64,8,8,1024,64,torch.float16,torch.float16,0.088,None],
+        [32,16,16,2048,64,torch.bfloat16,torch.bfloat16,0.0625,None],
+        [16,32,32,4096,64,torch.float16,torch.float16,0.0442,None],
+        [8,32,32,8192,64,torch.bfloat16,torch.bfloat16,0.03125,None],
+        [128,4,4,1024,64,torch.float16,torch.float16,0.088,None],
+        [64,4,4,4096,128,torch.bfloat16,torch.bfloat16,0.0625,None],
+        [32,16,16,8192,64,torch.float16,torch.float16,0.0442,None],
+        [16,32,32,16384,64,torch.bfloat16,torch.bfloat16,0.03125,None],
+        [64,8,8,2048,128,torch.float16,torch.float16,0.0625,None],
+        [32,16,16,4096,128,torch.bfloat16,torch.bfloat16,0.0442,None],
+        [16,32,32,8192,128,torch.float16,torch.float16,0.03125,None],
+        [8,32,32,8192,128,torch.bfloat16,torch.bfloat16,0.0221,None],  #C12
+        [1,4,4,1024,64,torch.float16,torch.float16,0.088,None],
+        [48,8,8,2048,64,torch.bfloat16,torch.bfloat16,0.0625,None],
+        [24,16,16,4096,64,torch.float16,torch.float16,0.0442,None],
+        [12,32,32,8192,64,torch.bfloat16,torch.bfloat16,0.03125,None],
+        [1,16,16,32768,64,torch.float16,torch.float32,0.0625,torch.tensor([0,16,20000,30000,32768])],      # V1
+        [1,8,8,65536,64,torch.bfloat16,torch.bfloat16,0.0625,torch.tensor([0,16,20000,65536])],
+        [1,32,32,65536,64,torch.float16,torch.float32,0.0442,torch.tensor([0,16,20000,50000,65536])],
+        [1,32,32,262144,64,torch.bfloat16,torch.bfloat16,0.03125,torch.tensor([0,16,20000,50000,65536,210000,262144])],
+        [1,8,8,4096,64,torch.float16,torch.float32,0.088,torch.tensor([0,1030,4001,4096])],  #21 [0,16,128] [0,16,135,512]
+        [1,32,32,16384,64,torch.bfloat16,torch.float32,0.088,None],  #21 [0,16,128]
     ]
     device_id = int(os.environ.get("TEST_DEVICE_ID", 0))
     
 
     dtype = torch.float16
     Gtype = torch.float16
-    B, H = 4, 8
+    B, HK, HV = 4, 8, 8
     T = 1024
     scale = 0.088
     if isVarLen:
@@ -498,20 +503,20 @@ if __name__ == "__main__":
         cu_seqlens = None
     if case_number != -1:
         single_case = cases[case_number-1]  #case_01 => cases[0]
-        dtype = single_case[4]
-        Gtype = single_case[5]
-        B, H = single_case[0], single_case[1]
-        chunk_size = single_case[3]
-        cu_seqlens = single_case[7]
+        dtype = single_case[5]
+        Gtype = single_case[6]
+        B, HK, HV = single_case[0], single_case[1], single_case[2]
+        chunk_size = single_case[4]
+        cu_seqlens = single_case[8]
         cu_seqlens_torch = torch.tensor(cu_seqlens) if cu_seqlens is not None else None
 
-        if single_case[7] is None:
+        if single_case[8] is None:
             isVarLen = False
         else:
             isVarLen = True
         # isVarLen == single_case[7] != None
-        T = single_case[2]
-        scale = single_case[6]
+        T = single_case[3]
+        scale = single_case[7]
 
     if isVarLen:
         B = 1  ##变长只支持B=1
@@ -524,20 +529,20 @@ if __name__ == "__main__":
         num_chunks = T // chunk_size
     
     if RANDOM_DATA:
-        q = torch.randn(B,T,H,K, dtype=dtype, requires_grad=True) * 5e-7 # std≈5e-6#torch.randn([B, T, H, K], dtype=dtype)
-        k = torch.randn(B,T,H,K, dtype=dtype, requires_grad=True) * 5e-7 * 100000  # torch.randn([B, T, H, K], dtype=dtype)
-        v = torch.randn(B,T,H,V, dtype=dtype, requires_grad=True) * 5e-7 * 10000  # torch.randn([B, T, H, V], dtype=dtype)
+        q = torch.randn(B,T,HK,K, dtype=dtype, requires_grad=True) * 5e-7 # std≈5e-6#torch.randn([B, T, H, K], dtype=dtype)
+        k = torch.randn(B,T,HK,K, dtype=dtype, requires_grad=True) * 5e-7 * 100000  # torch.randn([B, T, H, K], dtype=dtype)
+        v = torch.randn(B,T,HV,V, dtype=dtype, requires_grad=True) * 5e-7 * 10000  # torch.randn([B, T, H, V], dtype=dtype)
 
         # g = torch.randn(B,T,H, dtype=dtype, requires_grad=True) * 5e-2   # torch.randn([B, T, H], dtype=Gtype)
-        g = -torch.sort(torch.rand(B*T*H) * 100, descending=False)[0].reshape((B,T,H)).to(Gtype)    #G必须递减且为负数
+        g = -torch.sort(torch.rand(B*T*HV) * 100, descending=False)[0].reshape((B,T,HV)).to(Gtype)    #G必须递减且为负数
         # print("g",g)
-        do = torch.randn(B,T,H,V, dtype=dtype, requires_grad=True) * 5e-7 * 100000  # torch.randn([B, T, H, V], dtype=dtype)
+        do = torch.randn(B,T,HV,V, dtype=dtype, requires_grad=True) * 5e-7 * 100000  # torch.randn([B, T, H, V], dtype=dtype)
 
-        dv = torch.randn(B,T,H,V, dtype=dtype, requires_grad=True) * 5e-7 * 1000000  # torch.randn([B, T, H, V], dtype=dtype)
-        w = torch.randn(B,T,H,K, dtype=dtype, requires_grad=True) * 5e-7 * 100000  # torch.randn([B, T, H, K], dtype=dtype)
+        dv = torch.randn(B,T,HV,V, dtype=dtype, requires_grad=True) * 5e-7 * 1000000  # torch.randn([B, T, H, V], dtype=dtype)
+        w = torch.randn(B,T,HV,K, dtype=dtype, requires_grad=True) * 5e-7 * 100000  # torch.randn([B, T, H, K], dtype=dtype)
 
-        h = torch.randn(B, num_chunks, H, K, V, dtype=dtype, requires_grad=True) * 5e-7 * 100000  # torch.randn([B, num_chunks, H, K, V], dtype=dtype)
-        dh = torch.randn(B, num_chunks, H, K, V, dtype=dtype, requires_grad=True) * 5e-7 * 1000 # torch.randn([B, num_chunks, H, K, V], dtype=dtype)
+        h = torch.randn(B, num_chunks, HV, K, V, dtype=dtype, requires_grad=True) * 5e-7 * 100000  # torch.randn([B, num_chunks, H, K, V], dtype=dtype)
+        dh = torch.randn(B, num_chunks, HV, K, V, dtype=dtype, requires_grad=True) * 5e-7 * 1000 # torch.randn([B, num_chunks, H, K, V], dtype=dtype)
 
     q = q.to(dtype).to(calc_type)
     k = k.to(dtype).to(calc_type)
@@ -641,5 +646,9 @@ if __name__ == "__main__":
     # single(dw_npu,dw,calc_count=100000,dtype=type_dict[dtype])
     # single(dg_npu,dg,calc_count=100000,dtype=type_dict[Gtype])
 
+    compare_data(dq, dq_npu, threshold=2**-8 + 2**-14)
+    compare_data(dk, dk_npu, threshold=2**-8 + 2**-14)
+    compare_data(dw, dw_npu, threshold=2**-8 + 2**-14)
+    compare_data(dg, dg_npu, threshold=2**-8 + 2**-14)
 
     print("All done!")
