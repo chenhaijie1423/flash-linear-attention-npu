@@ -60,7 +60,7 @@ static __simd_vf__ inline void Mul1Half(
     // 一次性载入 g[0..BT-1] 并取负 (-g 在所有行共享)
     if constexpr (BT_SIZE == 64) {
         RegTensor<float> regG, regNegG;
-        LoadAlign<float, PostLiteral::POST_MODE_UPDATE>(regG, gFp32, V_LENGTH_FP32);
+        LoadAlign<float>(regG, gFp32);
         Muls(regNegG, regG, -1.0f, maskAll);
 
         for (uint16_t i = 0; i < realBt; i++) {
@@ -78,8 +78,8 @@ static __simd_vf__ inline void Mul1Half(
         // BT_SIZE == 128: g 分两个 64 元素半段
         RegTensor<float> regG0, regG1, regNegG0, regNegG1;
         RegTensor<float> regSum1, regExp1, regOut1;
-        LoadAlign<float, PostLiteral::POST_MODE_UPDATE>(regG0, gFp32, V_LENGTH_FP32);
-        LoadAlign<float, PostLiteral::POST_MODE_UPDATE>(regG1, gFp32, V_LENGTH_FP32);
+        LoadAlign<float>(regG0, gFp32);
+        LoadAlign<float>(regG1, gFp32 + V_LENGTH_FP32);
         Muls(regNegG0, regG0, -1.0f, maskAll);
         Muls(regNegG1, regG1, -1.0f, maskAll);
 
@@ -123,7 +123,7 @@ static __simd_vf__ inline void DqState(
     RegTensor<float> regG, regFactor, regDq1, regDq2, regOut1, regOut2;
 
     // 阶段 1: factor[i] = scale * exp(g[i]) -> factorScratch
-    uint16_t gLoopTimes = static_cast<uint16_t>(realBt / V_LENGTH_FP32);
+    uint16_t gLoopTimes = static_cast<uint16_t>((realBt + V_LENGTH_FP32 - 1) / V_LENGTH_FP32);
     uint32_t gLength = realBt;
     MaskReg maskAll = CreateMask<float, MaskPattern::ALL>();
     MaskReg maskG;
@@ -136,7 +136,7 @@ static __simd_vf__ inline void DqState(
     }
     LocalMemBar<MemType::VEC_STORE, MemType::VEC_LOAD>();
     // 阶段 2: dq[i][:] *= factor[i]  (与 DkStateMUL2 阶段 2 一致)
-    for (uint16_t i = 0; i < realBt; ++i) {
+    for (uint16_t i = 0; i < realBt; i++) {
         LoadAlign<float, LoadDist::DIST_BRC_B32>(regFactor, factorScratch + i);
         LoadAlign<float, PostLiteral::POST_MODE_UPDATE>(regDq1, dqFp32, V_LENGTH_FP32);
         LoadAlign<float, PostLiteral::POST_MODE_UPDATE>(regDq2, dqFp32, V_LENGTH_FP32);

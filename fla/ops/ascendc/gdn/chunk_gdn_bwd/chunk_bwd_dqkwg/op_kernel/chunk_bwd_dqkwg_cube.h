@@ -482,24 +482,25 @@ public:
                 for (uint32_t h = 0; h < params.HV; h++) {
                     // --- Part4: dq_inner = do @ h^T ---
                     {
-                        uint32_t hk_idx = h / params.n_ratio;
                         uint64_t doOffset = (h * params.T + bos) * params.V;
                         uint64_t hOffset = ((bIdx * params.HV + h) * params.numChunks + chunkIdx) * params.K * params.V;
-                        uint64_t dqOffset = (hk_idx * params.T + bos_hk) * params.K;
+                        uint64_t mm5Offset =
+                        DqkwgBtxKRingElemOffset(coreIdx, loopBase, loopIdx, coreNum, h, params.HV, params.BT,
+                                                params.K, groupRingDepth);
 
                         auto tensorDo = tla::MakeTensor(gmDo[doOffset], MakeLayoutFromTag(layoutBTxV), Arch::PositionGM{});
                         auto tensorH = tla::MakeTensor(gmH[hOffset], MakeLayoutFromTag(layoutVxK), Arch::PositionGM{});
-                        auto tensorDq = tla::MakeTensor(gmDq[dqOffset], MakeLayoutFromTag(layoutBTxK), Arch::PositionGM{});
+                        auto tensorMm5 = tla::MakeTensor(gmMm5[mm5Offset], MakeLayoutFromTag(layoutBTxK), Arch::PositionGM{});
 
                         auto tensorBlockDo = GetTile(tensorDo, tla::MakeCoord(0, 0),
                                                     tla::MakeShape(actualBlockShape4.m(), actualBlockShape4.k()));
                         auto tensorBlockH = GetTile(tensorH, tla::MakeCoord(0, 0),
                                                     tla::MakeShape(actualBlockShape4.k(), actualBlockShape4.n()));
-                        auto tensorBlockDq = GetTile(tensorDq, tla::MakeCoord(0, 0),
+                        auto tensorBlockMm5 = GetTile(tensorMm5, tla::MakeCoord(0, 0),
                                                     tla::MakeShape(actualBlockShape4.m(), actualBlockShape4.n()));
 
                         BlockMmadPart4 blockMmadPart4(resource);
-                        blockMmadPart4(tensorBlockDo, tensorBlockH, tensorBlockDq, actualBlockShape4);
+                        blockMmadPart4(tensorBlockDo, tensorBlockH, tensorBlockMm5, actualBlockShape4);
                     }
                     // --- Part6: mm6 = ds_temp @ k -> wsMm6 ---
                     {
@@ -532,24 +533,25 @@ public:
                 for (uint32_t h = 0; h < params.HV; h++) {
                     // --- Part5: dk_inner = v @ dh ---
                     {
-                        uint32_t hk_idx = h / params.n_ratio;
                         uint64_t vOffset = (h * params.T + bos) * params.V;
                         uint64_t dhOffset = ((bIdx * params.HV + h) * params.numChunks + chunkIdx) * params.K * params.V;
-                        uint64_t dkOffset = (hk_idx * params.T + bos_hk) * params.K;
+                        uint64_t mm6RingOffset = DqkwgShortBtxKRingElemOffset(
+                            coreIdx, loopIdx, coreNum, h, params.HV, params.BT, params.K,
+                            shortRingDepth);
 
                         auto tensorV = tla::MakeTensor(gmV[vOffset], MakeLayoutFromTag(layoutBTxV), Arch::PositionGM{});
                         auto tensorDh = tla::MakeTensor(gmDh[dhOffset], MakeLayoutFromTag(layoutVxK), Arch::PositionGM{});
-                        auto tensorDk = tla::MakeTensor(gmDk[dkOffset], MakeLayoutFromTag(layoutBTxK), Arch::PositionGM{});
-
+                        auto tensorMm6 = tla::MakeTensor(gmMm6[mm6RingOffset], MakeLayoutFromTag(layoutBTxK), Arch::PositionGM{});
+                        
                         auto tensorBlockV = GetTile(tensorV, tla::MakeCoord(0, 0),
                                                     tla::MakeShape(actualBlockShape5.m(), actualBlockShape5.k()));
                         auto tensorBlockDh = GetTile(tensorDh, tla::MakeCoord(0, 0),
                                                      tla::MakeShape(actualBlockShape5.k(), actualBlockShape5.n()));
-                        auto tensorBlockDk = GetTile(tensorDk, tla::MakeCoord(0, 0),
+                        auto tensorBlockMm6 = GetTile(tensorMm6, tla::MakeCoord(0, 0),
                                                      tla::MakeShape(actualBlockShape5.m(), actualBlockShape5.n()));
 
                         BlockMmadPart5 blockMmadPart5(resource);
-                        blockMmadPart5(tensorBlockV, tensorBlockDh, tensorBlockDk, actualBlockShape5);
+                        blockMmadPart5(tensorBlockV, tensorBlockDh, tensorBlockMm6, actualBlockShape5);
                     }
                     // --- Part7: mm7 = ds_temp^T @ q -> wsMm7 (复用 wsMm5) ---
                     {
