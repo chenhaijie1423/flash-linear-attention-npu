@@ -186,28 +186,25 @@ static __simd_vf__ inline void DgLastMulAccum(
     __ubuf__ float *sumFp32,       // [elemCount] in/out running sum (fp32); needAdd=false 时被覆盖, needAdd=true 时读加写
     __ubuf__ HalfT *hHalf,         // [elemCount] h tile (half / bfloat16_t)
     __ubuf__ HalfT *dhHalf,        // [elemCount] dh tile (half / bfloat16_t)
-    uint32_t elemCount)            // elemCount must be multiple of V_LENGTH_HALF
+    uint32_t elemCount)            // elemCount must be multiple of V_LENGTH_FP32
 {
-    uint16_t colLoopTimes = static_cast<uint16_t>(elemCount / V_LENGTH_HALF);
+    __ubuf__ float *srcAddr = sumFp32;
+    uint16_t colLoopTimes = static_cast<uint16_t>(elemCount / V_LENGTH_FP32);
     RegTensor<HalfT> regHH, regDhH;
-    RegTensor<float> regHF0, regHF1, regDhF0, regDhF1, regProd0, regProd1;
-    RegTensor<float> regS0, regS1;
+    RegTensor<float> regHF, regDhF, regProd;
+    RegTensor<float> regS;
     MaskReg maskAll = CreateMask<float, MaskPattern::ALL>();
     for (uint16_t j = 0; j < colLoopTimes; j++) {
-        LoadAlign<HalfT, PostLiteral::POST_MODE_UPDATE>(regHH, hHalf, V_LENGTH_HALF);
-        LoadAlign<HalfT, PostLiteral::POST_MODE_UPDATE>(regDhH, dhHalf, V_LENGTH_HALF);
-        CastHalf2Float<HalfT>(regHF0, regHF1, regHH, maskAll);
-        CastHalf2Float<HalfT>(regDhF0, regDhF1, regDhH, maskAll);
-        Mul(regProd0, regHF0, regDhF0, maskAll);
-        Mul(regProd1, regHF1, regDhF1, maskAll);
+        LoadAlign<HalfT, PostLiteral::POST_MODE_UPDATE, LoadDist::DIST_UNPACK_B16>(regHH, hHalf, V_LENGTH_FP32);
+        LoadAlign<HalfT, PostLiteral::POST_MODE_UPDATE, LoadDist::DIST_UNPACK_B16>(regDhH, dhHalf, V_LENGTH_FP32);
+        Cast<float, HalfT, ctHalf2Fp32Zero>(regHF, regHH, maskAll);
+        Cast<float, HalfT, ctHalf2Fp32Zero>(regDhF, regDhH, maskAll);
+        Mul(regProd, regHF, regDhF, maskAll);
         if constexpr (needAdd) {
-            LoadAlign<float, PostLiteral::POST_MODE_UPDATE>(regS0, sumFp32, V_LENGTH_FP32);
-            LoadAlign<float, PostLiteral::POST_MODE_UPDATE>(regS1, sumFp32, V_LENGTH_FP32);
-            Add(regProd0, regS0, regProd0, maskAll);
-            Add(regProd1, regS1, regProd1, maskAll);
+            LoadAlign<float, PostLiteral::POST_MODE_UPDATE>(regS, srcAddr, V_LENGTH_FP32);
+            Add(regProd, regS, regProd, maskAll);
         }
-        StoreAlign<float, PostLiteral::POST_MODE_UPDATE>(sumFp32, regProd0, V_LENGTH_FP32, maskAll);
-        StoreAlign<float, PostLiteral::POST_MODE_UPDATE>(sumFp32, regProd1, V_LENGTH_FP32, maskAll);
+        StoreAlign<float, PostLiteral::POST_MODE_UPDATE>(sumFp32, regProd, V_LENGTH_FP32, maskAll);
     }
 }
 

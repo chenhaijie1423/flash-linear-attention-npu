@@ -40,7 +40,6 @@ BEGIN_TILING_DATA_DEF(ChunkBwdDqkwgTilingData)
     TILING_DATA_FIELD_DEF(uint32_t, aicCoreNum);     // CV 深融合使用的 AIC blockDim (cube/vector 共用)
 
     // Workspace 偏移量 (按字节)
-    TILING_DATA_FIELD_DEF(uint64_t, wsBtxKSyncSlotsPerHead); // cross-stage group ring depth per core
     TILING_DATA_FIELD_DEF(uint64_t, wsDgLastOffset);     // PartA: b_dg_last 偏移
     TILING_DATA_FIELD_DEF(uint64_t, dgLastSize);         // PartA: b_dg_last 大小, 32B 对齐
     TILING_DATA_FIELD_DEF(uint64_t, wsMm5Offset);        // PartA: mm5 / GVA C: dq_inner / PartD: mm7
