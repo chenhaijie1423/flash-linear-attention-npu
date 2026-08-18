@@ -50,22 +50,23 @@ public:
 
 private:
     // 4 个 stage 的处理函数 (CV 深融合)
-    __aicore__ inline void ProcessAVector(uint32_t coreIdx, uint32_t loopIdx); // 原 Part1 (dw 取负 + dg_last) + 原 Part2 (mul1)
-    __aicore__ inline void ProcessBVector(uint32_t coreIdx, uint32_t loopIdx); // 原 Part3 (ds_temp + dg 部分)
-    __aicore__ inline void ProcessCVector(uint32_t coreIdx, uint32_t loopIdx); // 原 Part4 + Part6 (dq 最终)
-    __aicore__ inline void ProcessCVectorForGva(uint32_t coreIdx, uint32_t loopIdx); // 原 Part4 + Part6 (dq 最终) (GVA)
-    __aicore__ inline void ProcessDVector(uint32_t coreIdx, uint32_t loopIdx); // 原 Part5 + Part7 (dk 最终 + dg 最终)
-    __aicore__ inline void ProcessDVectorForGva(uint32_t coreIdx, uint32_t loopIdx); // 原 Part5 + Part7 (dk 最终 + dg 最终) (GVA)
+    // bos/real_BT 由 Process() 统一算一次后传入, 避免每个 stage 重复 GetChunkOffset
+    __aicore__ inline void ProcessAVector(uint32_t coreIdx, uint32_t loopIdx, uint32_t bos, uint32_t real_BT); // 原 Part1 (dw 取负 + dg_last)
+    __aicore__ inline void ProcessBVector(uint32_t coreIdx, uint32_t loopIdx, uint32_t bos, uint32_t real_BT); // 原 Part2 (mul1) + 原 Part3 (ds_temp + dg 部分)
+    __aicore__ inline void ProcessCVector(uint32_t coreIdx, uint32_t loopIdx, uint32_t bos, uint32_t real_BT); // 原 Part4 + Part6 (dq 最终)
+    __aicore__ inline void ProcessCVectorForGva(uint32_t coreIdx, uint32_t loopIdx, uint32_t bos, uint32_t real_BT); // 原 Part4 + Part6 (dq 最终) (GVA)
+    __aicore__ inline void ProcessDVector(uint32_t coreIdx, uint32_t loopIdx, uint32_t bos, uint32_t real_BT); // 原 Part5 + Part7 (dk 最终 + dg 最终)
+    __aicore__ inline void ProcessDVectorForGva(uint32_t coreIdx, uint32_t loopIdx, uint32_t bos, uint32_t real_BT); // 原 Part5 + Part7 (dk 最终 + dg 最终) (GVA)
 
     // mul1 一个 row-half 的计算 (= A 的 Part2 per-head 内核, 输出 fp32 到 outFp32[half] )。
     // A (小 case) 调它后 cast+写 GM; B (大 case) 调它两次 (两个 row-half) 后直接乘 ds, 省掉 mul1 GM 往返。
     __aicore__ inline void ComputeMul1HalfFp32(const LocalTensor<float> &outFp32, const LocalTensor<float> &tensorMaskA,
-                                               const LocalTensor<float> &tensorBrcbTemp, const LocalTensor<float> &tensorGFp32Left, 
+                                               const LocalTensor<float> &tensorGTmpFp32, const LocalTensor<float> &tensorGFp32Left, 
                                                const LocalTensor<float> &tensorGFp32Right, uint32_t BT_sub_start, uint32_t real_BT);
 
     __aicore__ inline void CopyGateWithPad(const LocalTensor<GType> &dst, const GlobalTensor<GType> &src, uint64_t offset,
                                            uint32_t validLen, uint32_t totalLen);
-    __aicore__ inline void ComputeDqState(const LocalTensor<float> &tensorDqInFp32, const LocalTensor<float> &tensorGFp32, const LocalTensor<float> &tensorShareTmpFp32, uint32_t real_BT);
+    __aicore__ inline void ComputeDqState(const LocalTensor<float> &tensorDqInFp32, const LocalTensor<float> &tensorGFp32, const LocalTensor<float> &tensorGTmpFp32, uint32_t real_BT);
 
 private:
     // 输入输出指针
@@ -127,7 +128,7 @@ private:
     TQue<TPosition::VECIN, 2> inQue1;
     TQue<TPosition::VECIN, 2> inQue2;
     TQue<TPosition::VECIN, 2> inQue3;
-    TQue<TPosition::VECIN, 2> inQue4; // 用于Add0累加
+    TQue<TPosition::VECIN, 2> inQue4;
     TQue<TPosition::VECOUT, 2> outQue1;
     TQue<TPosition::VECOUT, 2> outQue2;
 
@@ -135,11 +136,13 @@ private:
     // Calc Buffers (UB 空间)
     TBuf<TPosition::VECCALC> calcBuf1; // 主计算缓冲区 (fp32)
     TBuf<TPosition::VECCALC> calcBuf2; // 辅助计算缓冲区 (fp32)
-    TBuf<TPosition::VECCALC> calcBuf3; // Exp 缓冲区
     TBuf<TPosition::VECCALC> maskBuf;  // A_vector mask
     TBuf<TPosition::VECCALC> dgBuf;    // dg 值缓冲区
 
     // Local Tensors
+    LocalTensor<float> tensorGTmpFp32;
+    LocalTensor<float> tensorDgTmpFp32;
+    LocalTensor<float> tensorDgFinal;
     LocalTensor<float> tensorMaskA;
 
     // UB 空间常量
@@ -219,25 +222,25 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::Init(const C
 
     pipe->InitBuffer(inQue1, BUFFER_NUM, BT * K * sizeof(float));     // 64K
     pipe->InitBuffer(inQue2, BUFFER_NUM, BT * K * sizeof(float));     // 64K
-    pipe->InitBuffer(inQue3, 2, BT * sizeof(float));               // 1K
-    pipe->InitBuffer(inQue4, BUFFER_NUM, BT * sizeof(GType));      // 512B
+    pipe->InitBuffer(inQue3, 2, BT * sizeof(float));                  // 1K
+    pipe->InitBuffer(inQue4, 2, BT * sizeof(GType));                  // 1K
     pipe->InitBuffer(outQue1, BUFFER_NUM, BT * K * sizeof(DataType)); // 32K
-    pipe->InitBuffer(outQue2, BUFFER_NUM, BT * sizeof(float));     // 512B
+    pipe->InitBuffer(outQue2, BUFFER_NUM, BT * sizeof(float));        // 512B
 
-    pipe->InitBuffer(calcBuf1, BT * 8 * sizeof(float));            // 4K
-    pipe->InitBuffer(calcBuf2, BT * 8 * sizeof(float));            // 4K
-    pipe->InitBuffer(calcBuf3, BT * sizeof(float));                // 512B
+    pipe->InitBuffer(calcBuf1, BT * 8 * sizeof(float));               // 4K
+    pipe->InitBuffer(calcBuf2, BT * 8 * sizeof(float));               // 4K
     pipe->InitBuffer(maskBuf, 64 * 64 * sizeof(float));               // 16K
-    pipe->InitBuffer(dgBuf, BT * 8 * sizeof(float));               // 4K
+    pipe->InitBuffer(dgBuf, BT * 8 * sizeof(float));                  // 4K
 
+    tensorGTmpFp32 = calcBuf1.Get<float>();
+    tensorDgTmpFp32 = calcBuf2.Get<float>();
+    tensorDgFinal = dgBuf.Get<float>();
     tensorMaskA = maskBuf.Get<float>();
     Duplicate(tensorMaskA, 0.0f, 64 * 64);
     PipeBarrier<PIPE_V>();
     for (uint32_t i = 0; i < 64; i++) {
-        Duplicate(tensorMaskA[i * 64], 1.0f, i + 1);
+        Duplicate(tensorMaskA[i * 64], scale, i + 1);
     }
-    PipeBarrier<PIPE_V>();
-    Muls(tensorMaskA, tensorMaskA, scale, 64 * 64);
     PipeBarrier<PIPE_V>();
 }
 
@@ -250,14 +253,19 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::Process()
 
     uint32_t coreLoops = B * numChunks;
     for (uint32_t loopIdx = coreIdx; loopIdx < coreLoops; loopIdx += coreNum) {
-        ProcessAVector(coreIdx, loopIdx);
-        ProcessBVector(coreIdx, loopIdx);
+        // 统一算一次 bos/real_BT, 传给 4 个 stage 复用 (替代每 stage 内部 GetChunkOffset)
+        uint32_t bos = 0;
+        uint32_t eos = 0;
+        GetChunkOffset(cuSeqlensTensor, chunkIndicesTensor, B, HV, T, BT, loopIdx, bos, eos, isVarLen);
+        uint32_t real_BT = eos - bos;
+        ProcessAVector(coreIdx, loopIdx, bos, real_BT);
+        ProcessBVector(coreIdx, loopIdx, bos, real_BT);
         if (gvaMode) {
-            ProcessCVectorForGva(coreIdx, loopIdx);
-            ProcessDVectorForGva(coreIdx, loopIdx);
+            ProcessCVectorForGva(coreIdx, loopIdx, bos, real_BT);
+            ProcessDVectorForGva(coreIdx, loopIdx, bos, real_BT);
         } else {
-            ProcessCVector(coreIdx, loopIdx);
-            ProcessDVector(coreIdx, loopIdx);
+            ProcessCVector(coreIdx, loopIdx, bos, real_BT);
+            ProcessDVector(coreIdx, loopIdx, bos, real_BT);
         }
     }
 }
@@ -292,7 +300,7 @@ ChunkBwdDqkwgVectorProcess<DataType, GType>::CopyGateWithPad(const LocalTensor<G
 template <typename DataType, typename GType>
 __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ComputeMul1HalfFp32(
     const LocalTensor<float> &outFp32, const LocalTensor<float> &tensorMaskA, 
-    const LocalTensor<float> &tensorBrcbTemp, const LocalTensor<float> &tensorGFp32Left, 
+    const LocalTensor<float> &tensorGTmpFp32, const LocalTensor<float> &tensorGFp32Left, 
     const LocalTensor<float> &tensorGFp32Right, uint32_t BT_sub_start, uint32_t real_BT)
 {
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
@@ -310,10 +318,10 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ComputeMul1H
     }
 #else
     Muls(tensorGFp32Right, tensorGFp32Left, static_cast<float>(-1), BT);
-    Brcb(tensorBrcbTemp, tensorGFp32Left[BT_sub_start], CEIL_DIV(real_BT, 8), {1, 8});
+    Brcb(tensorGTmpFp32, tensorGFp32Left[BT_sub_start], CEIL_DIV(real_BT, 8), {1, 8});
     PipeBarrier<PIPE_V>();
     if (BT == 64) {
-        AscendC::Add(outFp32, tensorGFp32Right, tensorBrcbTemp, CAL_NUM_FLOAT, real_BT, {1, 1, 0, 8, 0, 1});
+        AscendC::Add(outFp32, tensorGFp32Right, tensorGTmpFp32, CAL_NUM_FLOAT, real_BT, {1, 1, 0, 8, 0, 1});
         PipeBarrier<PIPE_V>();
         Mins(outFp32, outFp32, static_cast<float>(0.0), real_BT * BT);
         PipeBarrier<PIPE_V>();
@@ -326,9 +334,9 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ComputeMul1H
         PipeBarrier<PIPE_V>();
         AscendC::Copy(outFp32[CAL_NUM_FLOAT], tensorGFp32Right[CAL_NUM_FLOAT], CAL_NUM_FLOAT, real_BT, {1, 1, 16, 0});
         PipeBarrier<PIPE_V>();
-        AscendC::Add(outFp32, outFp32, tensorBrcbTemp, CAL_NUM_FLOAT, real_BT, {1, 1, 0, 16, 16, 1});
+        AscendC::Add(outFp32, outFp32, tensorGTmpFp32, CAL_NUM_FLOAT, real_BT, {1, 1, 0, 16, 16, 1});
         PipeBarrier<PIPE_V>();
-        AscendC::Add(outFp32[CAL_NUM_FLOAT], outFp32[CAL_NUM_FLOAT], tensorBrcbTemp, CAL_NUM_FLOAT, real_BT,
+        AscendC::Add(outFp32[CAL_NUM_FLOAT], outFp32[CAL_NUM_FLOAT], tensorGTmpFp32, CAL_NUM_FLOAT, real_BT,
                      {1, 1, 0, 16, 16, 1});
         PipeBarrier<PIPE_V>();
         Mins(outFp32, outFp32, static_cast<float>(0.0), real_BT * BT);
@@ -355,21 +363,21 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ComputeMul1H
 // ComputeDqState: dq_state = dq_inner * exp(g)[:,None] * scale
 template <typename DataType, typename GType>
 __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ComputeDqState(
-    const LocalTensor<float> &tensorDqInFp32, const LocalTensor<float> &tensorGFp32, const LocalTensor<float> &tensorShareTmpFp32, uint32_t real_BT)
+    const LocalTensor<float> &tensorDqInFp32, const LocalTensor<float> &tensorGFp32, const LocalTensor<float> &tensorGTmpFp32, uint32_t real_BT)
 {
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
     DqState((__ubuf__ float *)tensorDqInFp32.GetPhyAddr(), (__ubuf__ float *)tensorDqInFp32.GetPhyAddr(), 
-            (__ubuf__ float *)tensorGFp32.GetPhyAddr(), (__ubuf__ float *)tensorShareTmpFp32.GetPhyAddr(), real_BT, scale);
+            (__ubuf__ float *)tensorGFp32.GetPhyAddr(), (__ubuf__ float *)tensorGTmpFp32.GetPhyAddr(), real_BT, scale);
 #else
     Exp(tensorGFp32, tensorGFp32, real_BT);
     PipeBarrier<PIPE_V>();
     Muls(tensorGFp32, tensorGFp32, scale, real_BT);
     PipeBarrier<PIPE_V>();
-    Brcb(tensorShareTmpFp32, tensorGFp32, CEIL_DIV(real_BT, 8), {1, 8});
+    Brcb(tensorGTmpFp32, tensorGFp32, CEIL_DIV(real_BT, 8), {1, 8});
     PipeBarrier<PIPE_V>();
-    AscendC::Mul(tensorDqInFp32, tensorDqInFp32, tensorShareTmpFp32, CAL_NUM_FLOAT, real_BT,
+    AscendC::Mul(tensorDqInFp32, tensorDqInFp32, tensorGTmpFp32, CAL_NUM_FLOAT, real_BT,
                     {1, 1, 0, 16, 16, 1});
-    AscendC::Mul(tensorDqInFp32[CAL_NUM_FLOAT], tensorDqInFp32[CAL_NUM_FLOAT], tensorShareTmpFp32,
+    AscendC::Mul(tensorDqInFp32[CAL_NUM_FLOAT], tensorDqInFp32[CAL_NUM_FLOAT], tensorGTmpFp32,
                     CAL_NUM_FLOAT, real_BT, {1, 1, 0, 16, 16, 1});
     PipeBarrier<PIPE_V>();
 #endif
@@ -380,18 +388,13 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ComputeDqSta
 // 每 chunk: WaitCubeReady 一次 -> Part1 (head-split) -> SetVectorDone 一次。
 // 依赖: Part1 读 dw(由 A_cube 产出); mul1 改由 B_vector 内联计算, 不再预写 GM。
 template <typename DataType, typename GType>
-__aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessAVector(uint32_t coreIdx, uint32_t loopIdx)
+__aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessAVector(uint32_t coreIdx, uint32_t loopIdx, uint32_t bos, uint32_t real_BT)
 {
     const uint32_t hDhSize = mul0RowNum * V; // 16 * 256 or 32 * 128 = 4k
-    const uint32_t dwSize = BT * K;
 
     // ----- Part1 buffers (h/dh, dw) -----
-    uint32_t bos = 0;
-    uint32_t eos = 0;
     uint32_t bIdx = loopIdx / numChunks;
     uint32_t chunkIdx = loopIdx % numChunks;
-    GetChunkOffset(cuSeqlensTensor, chunkIndicesTensor, B, HV, T, BT, loopIdx, bos, eos, isVarLen);
-    uint32_t real_BT = eos - bos;
     uint32_t actual_dwSize = real_BT * K;
     WaitCubeReady();
 
@@ -462,7 +465,7 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessAVect
         // ===== dw = -dw, then vector-repair row-0 first block =====
         {
             auto tensorDwIn = inQue1.AllocTensor<DataType>();
-            DataCopy(tensorDwIn[dwSize], gmDw[dwOffset], actual_dwSize);
+            DataCopy(tensorDwIn[actual_dwSize], gmDw[dwOffset], actual_dwSize);
             inQue1.EnQue(tensorDwIn);
         }
         {
@@ -470,11 +473,11 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessAVect
             auto tensorDwOut = outQue1.AllocTensor<DataType>();
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
             DwNegate<DataType>((__ubuf__ DataType *)tensorDwOut.GetPhyAddr(),
-                                (__ubuf__ DataType *)tensorDwIn[dwSize].GetPhyAddr(),
+                                (__ubuf__ DataType *)tensorDwIn[actual_dwSize].GetPhyAddr(),
                                 actual_dwSize);
 #else
             auto tensorDwInFp32 = tensorDwIn.template ReinterpretCast<float>();
-            Cast(tensorDwInFp32, tensorDwIn[dwSize], RoundMode::CAST_NONE, actual_dwSize);
+            Cast(tensorDwInFp32, tensorDwIn[actual_dwSize], RoundMode::CAST_NONE, actual_dwSize);
             PipeBarrier<PIPE_V>();
             Muls(tensorDwInFp32, tensorDwInFp32, -1.0f, actual_dwSize);
             PipeBarrier<PIPE_V>();
@@ -493,18 +496,11 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessAVect
     SetVecCredit();
 }
 
-// ============== B_vector: 原 Part3 (ds_temp + dg 部分) ==============
+// ============== B_vector: 原 Part2 (mul1) + 原 Part3 (ds_temp + dg 部分) ==============
 // 每 chunk: WaitCubeReady 一次 -> head-split 处理 (读 ds(B_cube), 内联算 mul1, 读 mm5(A_cube)) -> SetVectorDone 一次。
 template <typename DataType, typename GType>
-__aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessBVector(uint32_t coreIdx, uint32_t loopIdx)
+__aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessBVector(uint32_t coreIdx, uint32_t loopIdx, uint32_t bos, uint32_t real_BT)
 {
-    auto tensorBrcbTemp = calcBuf1.Get<float>();
-    auto tensorGFp32Right = calcBuf3.Get<float>();
-
-    uint32_t bos = 0;
-    uint32_t eos = 0;
-    GetChunkOffset(cuSeqlensTensor, chunkIndicesTensor, B, HV, T, BT, loopIdx, bos, eos, isVarLen);
-    uint32_t real_BT = eos - bos;
     uint32_t actual_dsSize = real_BT * BT;
     WaitCubeReady();
 
@@ -547,9 +543,9 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessBVect
             auto tensorMul1InFp32 = inQue2.AllocTensor<float>();
             uint32_t vec0 = (real_BT >= 64) ? 64 : real_BT;
             uint32_t vec1 = (real_BT > 64) ? (real_BT - 64) : 0;
-            ComputeMul1HalfFp32(tensorMul1InFp32, tensorMaskA, tensorBrcbTemp, tensorGFp32Left, tensorGFp32Right, 0, vec0);
+            ComputeMul1HalfFp32(tensorMul1InFp32, tensorMaskA, tensorGTmpFp32, tensorGFp32Left, tensorDgTmpFp32, 0, vec0);
             if (vec1 > 0) {
-                ComputeMul1HalfFp32(tensorMul1InFp32[vec0 * BT], tensorMaskA, tensorBrcbTemp, tensorGFp32Left, tensorGFp32Right, vec0, vec1);
+                ComputeMul1HalfFp32(tensorMul1InFp32[vec0 * BT], tensorMaskA, tensorGTmpFp32, tensorGFp32Left, tensorDgTmpFp32, vec0, vec1);
             }
             PipeBarrier<PIPE_V>();
             // b_ds_temp = b_ds * mul1 (已应用掩码)
@@ -618,13 +614,8 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessBVect
 // C_cube 在一次 SetCubeReady 前已产出 dq_inner(ptrDq) 与 mm6(wsMm6); C_vector 一次 WaitCubeReady 后
 // 同时读取二者 (无 per-head phase 握手), 计算 dq_state/dg 并 dq += mm6。
 template <typename DataType, typename GType>
-__aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessCVector(uint32_t coreIdx, uint32_t loopIdx)
+__aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessCVector(uint32_t coreIdx, uint32_t loopIdx, uint32_t bos, uint32_t real_BT)
 {
-    auto tensorShareTmpFp32 = calcBuf1.Get<float>();
-    uint32_t bos = 0;
-    uint32_t eos = 0;
-    GetChunkOffset(cuSeqlensTensor, chunkIndicesTensor, B, HV, T, BT, loopIdx, bos, eos, isVarLen);
-    uint32_t real_BT = eos - bos;
     uint32_t actual_dqSize = real_BT * K;
     WaitCubeReady();
 
@@ -677,7 +668,7 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessCVect
             PipeBarrier<PIPE_V>();
 
             // dq_state = dq_inner * exp(g)[:,None] * scale
-            ComputeDqState(tensorDqInFp32, tensorGFp32, tensorShareTmpFp32, real_BT);
+            ComputeDqState(tensorDqInFp32, tensorGFp32, tensorGTmpFp32, real_BT);
 
             // dg_C = row_sum(dq_state * q)
             Mul(tensorQInFp32, tensorDqInFp32, tensorQInFp32, actual_dqSize);
@@ -735,14 +726,9 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessCVect
 }
 
 template <typename DataType, typename GType>
-__aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessCVectorForGva(uint32_t coreIdx, uint32_t loopIdx)
+__aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessCVectorForGva(uint32_t coreIdx, uint32_t loopIdx, uint32_t bos, uint32_t real_BT)
 {
-    auto tensorShareTmpFp32 = calcBuf1.Get<float>();
     uint32_t half_dqSize = half_BT * K;
-    uint32_t bos = 0;
-    uint32_t eos = 0;
-    GetChunkOffset(cuSeqlensTensor, chunkIndicesTensor, B, HV, T, BT, loopIdx, bos, eos, isVarLen);
-    uint32_t real_BT = eos - bos;
     uint32_t actual_dqSize = real_BT * K;
     uint32_t first_BT = real_BT > half_BT ? half_BT : real_BT;
     uint32_t second_BT = real_BT - first_BT;
@@ -807,7 +793,7 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessCVect
             PipeBarrier<PIPE_V>();
 
             // dq_state = dq_inner * exp(g)[:,None] * scale
-            ComputeDqState(tensorDqInFp32, tensorGFp32, tensorShareTmpFp32, first_BT);
+            ComputeDqState(tensorDqInFp32, tensorGFp32, tensorGTmpFp32, first_BT);
 
             // dg_C = row_sum(dq_state * q)
             Mul(tensorQInFp32, tensorDqInFp32, tensorQInFp32, first_dqSize);
@@ -847,7 +833,7 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessCVect
                 PipeBarrier<PIPE_V>();
 
                 // dq_state = dq_inner * exp(g)[:,None] * scale
-                ComputeDqState(tensorDqInFp32, tensorGFp32[half_BT], tensorShareTmpFp32, second_BT);
+                ComputeDqState(tensorDqInFp32, tensorGFp32[half_BT], tensorGTmpFp32, second_BT);
 
                 // dg_C = row_sum(dq_state * q)
                 Mul(tensorQInFp32, tensorDqInFp32, tensorQInFp32, second_dqSize);
@@ -918,16 +904,8 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessCVect
 // D_cube 在一次 SetCubeReady 前已产出 dk_inner(ptrDk) 与 mm7(wsMm7); D_vector 一次 WaitCubeReady 后
 // 读取二者, 完成 dk_state / dg 最终 / dk += mm7。dg_last 本地重算 (与原 Part5 一致)。
 template <typename DataType, typename GType>
-__aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessDVector(uint32_t coreIdx, uint32_t loopIdx)
+__aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessDVector(uint32_t coreIdx, uint32_t loopIdx, uint32_t bos, uint32_t real_BT)
 {
-    auto tensorDgFinal = dgBuf.Get<float>();
-    auto tensorGLastFp32Tmp = calcBuf1.Get<float>();
-    auto tensorDgLastFp32Tmp = calcBuf2.Get<float>();
-
-    uint32_t bos = 0;
-    uint32_t eos = 0;
-    GetChunkOffset(cuSeqlensTensor, chunkIndicesTensor, B, HV, T, BT, loopIdx, bos, eos, isVarLen);
-    uint32_t real_BT = eos - bos;
     uint32_t real_BT_aligned = (real_BT + 15) / 16 * 16;
     uint32_t actual_dkSize = real_BT * K;
     WaitCubeReady();
@@ -943,7 +921,7 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessDVect
 
         // CV 融合优化: 读 A_vector 算好的 dg_last = sum(h*dh) (替代本地重算, 省 D 的 h/dh 读 + K*V 归约)。
         // 跨 stage 可见性由 Process() 中 A->B->C->D 的 PipeBarrier<PIPE_ALL> 保证; A(c,h)/D(c,h) 同 sub-block。
-        // 输出格式与原重算一致: tensorGLastFp32Tmp[16..23] = 8 份 dg_last。
+        // 输出格式与原重算一致: tensorGTmpFp32[16..23] = 8 份 dg_last。
         {
             uint64_t dgLastOffset = DqkwgScalarRingElemOffset(coreIdx, h, HV);
             DataCopyExtParams copyParams{1, sizeof(float), 0, 0, 0};
@@ -951,11 +929,11 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessDVect
             TEventID eventId = GetTPipePtr()->FetchEventID(HardEvent::V_MTE2);
             SetFlag<HardEvent::V_MTE2>(eventId);
             WaitFlag<HardEvent::V_MTE2>(eventId);
-            DataCopyPad(tensorDgLastFp32Tmp[8], gmDgLast[dgLastOffset], copyParams, padParams);
+            DataCopyPad(tensorDgTmpFp32[8], gmDgLast[dgLastOffset], copyParams, padParams);
             TEventID eDg = GetTPipePtr()->FetchEventID(HardEvent::MTE2_V);
             SetFlag<HardEvent::MTE2_V>(eDg);
             WaitFlag<HardEvent::MTE2_V>(eDg);
-            Brcb(tensorGLastFp32Tmp[16], tensorDgLastFp32Tmp[8], 1, {1, 8}); // 广播到 [16..23] 8 份
+            Brcb(tensorGTmpFp32[16], tensorDgTmpFp32[8], 1, {1, 8}); // 广播到 [16..23] 8 份
             PipeBarrier<PIPE_V>();
         }
 
@@ -1004,7 +982,7 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessDVect
             Brcb(tensorDgFinal, tensorGFp32[last_line_no], 1, {1, 8}); // [8,8] 第 last_line_idx 行 = gLast
             PipeBarrier<PIPE_V>();
             Muls(tensorGFp32, tensorGFp32, -1.0f, real_BT_aligned);
-            DataCopy(tensorGLastFp32Tmp, tensorDgFinal[last_line_idx * 8], 8);
+            DataCopy(tensorGTmpFp32, tensorDgFinal[last_line_idx * 8], 8);
             PipeBarrier<PIPE_V>();
             AscendC::Add(tensorGFp32, tensorGFp32, tensorDgFinal[last_line_idx * 8], CAL_NUM_FLOAT,
                             BT / CAL_NUM_FLOAT, {1, 1, 0, 8, 8, 0});
@@ -1041,15 +1019,15 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessDVect
                 WholeReduceSum(tensorDgFinal, tensorGFp32, real_BT, 1, 1, 1, 8);
                 PipeBarrier<PIPE_V>();
             }
-            Brcb(tensorDgLastFp32Tmp, tensorDgFinal, 1, {1, 8});
+            Brcb(tensorDgTmpFp32, tensorDgFinal, 1, {1, 8});
             PipeBarrier<PIPE_V>();
-            Exp(tensorGLastFp32Tmp, tensorGLastFp32Tmp, 8);
+            Exp(tensorGTmpFp32, tensorGTmpFp32, 8);
             PipeBarrier<PIPE_V>();
-            Mul(tensorDgLastFp32Tmp[16], tensorGLastFp32Tmp[16], tensorGLastFp32Tmp, 8);
+            Mul(tensorDgTmpFp32[16], tensorGTmpFp32[16], tensorGTmpFp32, 8);
             PipeBarrier<PIPE_V>();
-            Add(tensorDgLastFp32Tmp[16], tensorDgLastFp32Tmp[16], tensorDgLastFp32Tmp, 8); // add4 = dg_last_term
+            Add(tensorDgTmpFp32[16], tensorDgTmpFp32[16], tensorDgTmpFp32, 8); // add4 = dg_last_term
             PipeBarrier<PIPE_V>();
-            Brcb(tensorDgFinal, tensorDgLastFp32Tmp[16], 1, {1, 8});
+            Brcb(tensorDgFinal, tensorDgTmpFp32[16], 1, {1, 8});
             PipeBarrier<PIPE_V>();
             uint64_t offset = (real_BT - 1) / 8 * 8;
             uint64_t mask[1] = {0};
@@ -1111,17 +1089,9 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessDVect
 //  4. dg 仍逐 HV head 写回; dk 仅在 h % n_ratio == n_ratio - 1 时写回 (HK head 粒度);
 //  5. mm7 逐 HV head 累加到 dkSum。
 template <typename DataType, typename GType>
-__aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessDVectorForGva(uint32_t coreIdx, uint32_t loopIdx)
+__aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessDVectorForGva(uint32_t coreIdx, uint32_t loopIdx, uint32_t bos, uint32_t real_BT)
 {
-    auto tensorDgFinal = dgBuf.Get<float>();
-    auto tensorGLastFp32Tmp = calcBuf1.Get<float>();
-    auto tensorDgLastFp32Tmp = calcBuf2.Get<float>();
-
     uint32_t half_dkSize = half_BT * K;
-    uint32_t bos = 0;
-    uint32_t eos = 0;
-    GetChunkOffset(cuSeqlensTensor, chunkIndicesTensor, B, HV, T, BT, loopIdx, bos, eos, isVarLen);
-    uint32_t real_BT = eos - bos;
     uint32_t real_BT_aligned = (real_BT + 15) / 16 * 16;
     uint32_t actual_dkSize = real_BT * K;
     uint32_t first_BT = real_BT > half_BT ? half_BT : real_BT;
@@ -1151,11 +1121,11 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessDVect
             WaitFlag<HardEvent::V_MTE2>(eventId);
             DataCopyExtParams copyParams{1, sizeof(float), 0, 0, 0};
             DataCopyPadExtParams<float> padParams{true, 0, 7, 0};
-            DataCopyPad(tensorDgLastFp32Tmp[8], gmDgLast[dgLastOffset], copyParams, padParams);
+            DataCopyPad(tensorDgTmpFp32[8], gmDgLast[dgLastOffset], copyParams, padParams);
             TEventID eDg = GetTPipePtr()->FetchEventID(HardEvent::MTE2_V);
             SetFlag<HardEvent::MTE2_V>(eDg);
             WaitFlag<HardEvent::MTE2_V>(eDg);
-            Brcb(tensorGLastFp32Tmp[16], tensorDgLastFp32Tmp[8], 1, {1, 8}); // 广播到 [16..23] 8 份
+            Brcb(tensorGTmpFp32[16], tensorDgTmpFp32[8], 1, {1, 8}); // 广播到 [16..23] 8 份
             PipeBarrier<PIPE_V>();
         }
 
@@ -1190,7 +1160,7 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessDVect
         Brcb(tensorDgFinal, tensorGFp32[last_line_no], 1, {1, 8}); // [8,8] 第 last_line_idx 行 = gLast
         PipeBarrier<PIPE_V>();
         Muls(tensorGFp32, tensorGFp32, -1.0f, real_BT_aligned);
-        DataCopy(tensorGLastFp32Tmp, tensorDgFinal[last_line_idx * 8], 8);
+        DataCopy(tensorGTmpFp32, tensorDgFinal[last_line_idx * 8], 8);
         PipeBarrier<PIPE_V>();
         AscendC::Add(tensorGFp32, tensorGFp32, tensorDgFinal[last_line_idx * 8], CAL_NUM_FLOAT,
                         BT / CAL_NUM_FLOAT, {1, 1, 0, 8, 8, 0});
@@ -1307,15 +1277,15 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessDVect
             WholeReduceSum(tensorDgFinal, tensorGFp32, real_BT, 1, 1, 1, 8);
             PipeBarrier<PIPE_V>();
         }
-        Brcb(tensorDgLastFp32Tmp, tensorDgFinal, 1, {1, 8});
+        Brcb(tensorDgTmpFp32, tensorDgFinal, 1, {1, 8});
         PipeBarrier<PIPE_V>();
-        Exp(tensorGLastFp32Tmp, tensorGLastFp32Tmp, 8);
+        Exp(tensorGTmpFp32, tensorGTmpFp32, 8);
         PipeBarrier<PIPE_V>();
-        Mul(tensorDgLastFp32Tmp[16], tensorGLastFp32Tmp[16], tensorDgLastFp32Tmp, 8);
+        Mul(tensorDgTmpFp32[16], tensorGTmpFp32[16], tensorGTmpFp32, 8);
         PipeBarrier<PIPE_V>();
-        Add(tensorDgLastFp32Tmp[16], tensorDgLastFp32Tmp[16], tensorDgLastFp32Tmp, 8); // add4 = dg_last_term
+        Add(tensorDgTmpFp32[16], tensorDgTmpFp32[16], tensorDgTmpFp32, 8); // add4 = dg_last_term
         PipeBarrier<PIPE_V>();
-        Brcb(tensorDgFinal, tensorDgLastFp32Tmp[16], 1, {1, 8});
+        Brcb(tensorDgFinal, tensorDgTmpFp32[16], 1, {1, 8});
         PipeBarrier<PIPE_V>();
         uint64_t offset = (real_BT - 1) / 8 * 8;
         uint64_t mask[1] = {0};
