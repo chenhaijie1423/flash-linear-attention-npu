@@ -274,10 +274,12 @@ public:
         GM_ADDR ptrWorkspace;
 
         // Workspace 偏移
-        uint64_t wsMm5Offset;
-        uint64_t wsDsTempOffset;
+        uint64_t wsMm3Offset;
+        uint64_t wsMm4Offset;
         uint64_t wsMm6Offset;
+        uint64_t wsMm5Offset;
         uint64_t wsMm7Offset;
+        uint64_t wsDsTempOffset;
 
         // 形状参数 (GVA: H 拆为 HV/HK, HV = n_ratio * HK)
         uint64_t B;              // = CONST_B;
@@ -296,11 +298,12 @@ public:
         Params(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR h, GM_ADDR do_, GM_ADDR dh, GM_ADDR dv, GM_ADDR cu_seqlen,
                GM_ADDR chunk_indices, GM_ADDR dq, GM_ADDR dk, GM_ADDR dw,GM_ADDR workspace, uint64_t B, uint64_t HV, uint64_t HK,
                uint64_t T, uint64_t K, uint64_t V, uint64_t BT, uint64_t numChunks, uint64_t n_ratio, bool isVarLen,
-               uint64_t wsMm5, uint64_t wsDsTemp, uint64_t wsMm6, uint64_t wsMm7)
+               uint64_t wsMm3, uint64_t wsMm4, uint64_t wsMm6, uint64_t wsMm5, uint64_t wsMm7, uint64_t wsDsTemp)
             : ptrQ(q), ptrK(k), ptrV(v), ptrH(h), ptrDo(do_), ptrDh(dh), ptrDv(dv), ptrCuSeqLens(cu_seqlen),
               ptrChunkIndices(chunk_indices), ptrDq(dq), ptrDk(dk), ptrDw(dw), ptrWorkspace(workspace),
-              wsMm5Offset(wsMm5), wsDsTempOffset(wsDsTemp), wsMm6Offset(wsMm6),
-              wsMm7Offset(wsMm7), B(B), HV(HV), HK(HK), T(T), K(K), V(V), BT(BT), numChunks(numChunks), n_ratio(n_ratio), isVarLen(isVarLen)
+              wsMm3Offset(wsMm3), wsMm4Offset(wsMm4), wsMm6Offset(wsMm6), wsMm5Offset(wsMm5),
+              wsMm7Offset(wsMm7), wsDsTempOffset(wsDsTemp), B(B), HV(HV), HK(HK), T(T), K(K), V(V), BT(BT), 
+              numChunks(numChunks), n_ratio(n_ratio), isVarLen(isVarLen)
         {
         }
     };
@@ -316,11 +319,13 @@ public:
     GlobalTensor<ElementC> gmDq;
     GlobalTensor<ElementC> gmDk;
     GlobalTensor<ElementC> gmDw;
+    GlobalTensor<ElementC> gmMm3;
+    GlobalTensor<ElementC> gmMm4;
+    GlobalTensor<ElementC> gmMm6;
+    GlobalTensor<ElementC> gmMm5;
+    GlobalTensor<ElementC> gmMm7;
     GlobalTensor<ElementC> gmDs;
     GlobalTensor<ElementA> gmDsTemp;
-    GlobalTensor<ElementC> gmMm5;
-    GlobalTensor<ElementC> gmMm6;
-    GlobalTensor<ElementC> gmMm7;
     GlobalTensor<uint64_t> cuSeqlensTensor;
     GlobalTensor<uint64_t> chunkIndicesTensor;
 
@@ -361,11 +366,13 @@ public:
         gmDq.SetGlobalBuffer((__gm__ ElementC *)params.ptrDq);
         gmDk.SetGlobalBuffer((__gm__ ElementC *)params.ptrDk);
         gmDw.SetGlobalBuffer((__gm__ ElementC *)params.ptrDw);
+        gmMm3.SetGlobalBuffer((__gm__ ElementC *)((__gm__ uint8_t *)params.ptrWorkspace + params.wsMm3Offset));
+        gmMm4.SetGlobalBuffer((__gm__ ElementC *)((__gm__ uint8_t *)params.ptrWorkspace + params.wsMm4Offset));
+        gmMm6.SetGlobalBuffer((__gm__ ElementC *)((__gm__ uint8_t *)params.ptrWorkspace + params.wsMm6Offset));
+        gmMm5.SetGlobalBuffer((__gm__ ElementC *)((__gm__ uint8_t *)params.ptrWorkspace + params.wsMm5Offset));
+        gmMm7.SetGlobalBuffer((__gm__ ElementC *)((__gm__ uint8_t *)params.ptrWorkspace + params.wsMm7Offset));
         gmDs.SetGlobalBuffer((__gm__ ElementC *)((__gm__ uint8_t *)params.ptrWorkspace + params.wsDsTempOffset));
         gmDsTemp.SetGlobalBuffer((__gm__ ElementA *)((__gm__ uint8_t *)params.ptrWorkspace + params.wsDsTempOffset));
-        gmMm5.SetGlobalBuffer((__gm__ ElementC *)((__gm__ uint8_t *)params.ptrWorkspace + params.wsMm5Offset));
-        gmMm6.SetGlobalBuffer((__gm__ ElementC *)((__gm__ uint8_t *)params.ptrWorkspace + params.wsMm6Offset));
-        gmMm7.SetGlobalBuffer((__gm__ ElementC *)((__gm__ uint8_t *)params.ptrWorkspace + params.wsMm7Offset));
         if (params.isVarLen) {
             cuSeqlensTensor.SetGlobalBuffer((__gm__ uint64_t *)params.ptrCuSeqLens);
             chunkIndicesTensor.SetGlobalBuffer((__gm__ uint64_t *)params.ptrChunkIndices);
@@ -407,7 +414,6 @@ public:
             GemmCoord actualBlockShape7{actual_chunk_len, K, actual_chunk_len};     // [BT, BT] @ [BT, K]
             
             // --- Part1: dw = dv @ h^T ---
-            WaitCredit();
             for (uint32_t h = 0; h < params.HV; h++) {
                 uint64_t dvOffset = (h * params.T + bos) * params.V;
                 uint64_t hOffset = ((bIdx * params.HV + h) * params.numChunks + chunkIdx) * params.K * params.V;
@@ -427,32 +433,31 @@ public:
                 blockMmadPart1(tensorBlockDv, tensorBlockH, tensorBlockDw, actualBlockShape1);
             }
             SetCubeReady();
-            // --- Part2: mm5 = q @ k^T -> wsMm5 (B_vector 在后续 stage 消费) ---
+            // --- Part2: mm3 = q @ k^T -> wsMm3 (B_vector 在后续 stage 消费) ---
             for (uint32_t h = 0; h < params.HV; h++) {
                 // GVA: q/k 为 HK 头; hv_idx=h -> hk_idx=h/n_ratio, 并把 HV-based bos 修正为 HK-based
                 uint32_t hk_idx = h / params.n_ratio;
                 uint64_t qkOffset = (hk_idx * params.T + bos_hk) * params.K;
-                uint64_t mm5Offset = DqkwgBtxKRingElemOffset(coreIdx, h, params.HV, params.BT, params.K);
+                uint64_t mm3Offset = DqkwgBtbElemOffset(coreIdx, h, params.HV, params.BT);
 
                 auto tensorQ = tla::MakeTensor(gmQ[qkOffset], MakeLayoutFromTag(layoutBTxK), Arch::PositionGM{});
                 auto tensorK = tla::MakeTensor(gmK[qkOffset], MakeLayoutFromTag(layoutKxBT), Arch::PositionGM{}); // k^T
-                auto tensorMm5 = tla::MakeTensor(gmMm5[mm5Offset], MakeLayoutFromTag(layoutBTxBT), Arch::PositionGM{});
+                auto tensorMm3 = tla::MakeTensor(gmMm3[mm3Offset], MakeLayoutFromTag(layoutBTxBT), Arch::PositionGM{});
 
                 auto tensorBlockQ = GetTile(tensorQ, tla::MakeCoord(0, 0),
                                             tla::MakeShape(actualBlockShape2.m(), actualBlockShape2.k()));
                 auto tensorBlockK = GetTile(tensorK, tla::MakeCoord(0, 0),
                                             tla::MakeShape(actualBlockShape2.k(), actualBlockShape2.n()));
-                auto tensorBlockMm5 = GetTile(tensorMm5, tla::MakeCoord(0, 0),
+                auto tensorBlockMm3 = GetTile(tensorMm3, tla::MakeCoord(0, 0),
                                                 tla::MakeShape(actualBlockShape2.m(), actualBlockShape2.n()));
 
                 BlockMmadPart2 blockMmadPart2(resource);
-                blockMmadPart2(tensorBlockQ, tensorBlockK, tensorBlockMm5, actualBlockShape2);
+                blockMmadPart2(tensorBlockQ, tensorBlockK, tensorBlockMm3, actualBlockShape2);
             }
             // --- Part3: ds = do @ v^T -> wsDsTemp ---
-            WaitCredit();
             for (uint32_t h = 0; h < params.HV; h++) {
                 uint64_t dvOffset = (h * params.T + bos) * params.V;
-                uint64_t dsOffset = DqkwgBtbRingElemOffset(coreIdx, h, params.HV, params.BT);
+                uint64_t dsOffset = DqkwgBtbElemOffset(coreIdx, h, params.HV, params.BT);
 
                 auto tensorDo = tla::MakeTensor(gmDo[dvOffset], MakeLayoutFromTag(layoutBTxV), Arch::PositionGM{});
                 auto tensorV = tla::MakeTensor(gmV[dvOffset], MakeLayoutFromTag(layoutVxBT), Arch::PositionGM{}); // v^T
@@ -468,39 +473,41 @@ public:
                 blockMmadPart3(tensorBlockDo, tensorBlockV, tensorBlockDs, actualBlockShape3);
             }
             SetCubeReady();
-            WaitCredit();
             for (uint32_t h = 0; h < params.HV; h++) {
                 // --- Part4: dq_inner = do @ h^T ---
                 {
                     uint64_t doOffset = (h * params.T + bos) * params.V;
                     uint64_t hOffset = ((bIdx * params.HV + h) * params.numChunks + chunkIdx) * params.K * params.V;
-                    uint64_t mm5Offset = DqkwgBtxKRingElemOffset(coreIdx, h, params.HV, params.BT, params.K);
+                    uint64_t mm4Offset = DqkwgBtxKElemOffset(coreIdx, h, params.HV, params.BT, params.K);
 
                     auto tensorDo = tla::MakeTensor(gmDo[doOffset], MakeLayoutFromTag(layoutBTxV), Arch::PositionGM{});
                     auto tensorH = tla::MakeTensor(gmH[hOffset], MakeLayoutFromTag(layoutVxK), Arch::PositionGM{});
-                    auto tensorMm5 = tla::MakeTensor(gmMm5[mm5Offset], MakeLayoutFromTag(layoutBTxK), Arch::PositionGM{});
+                    auto tensorMm4 = tla::MakeTensor(gmMm4[mm4Offset], MakeLayoutFromTag(layoutBTxK), Arch::PositionGM{});
 
                     auto tensorBlockDo = GetTile(tensorDo, tla::MakeCoord(0, 0),
                                                 tla::MakeShape(actualBlockShape4.m(), actualBlockShape4.k()));
                     auto tensorBlockH = GetTile(tensorH, tla::MakeCoord(0, 0),
                                                 tla::MakeShape(actualBlockShape4.k(), actualBlockShape4.n()));
-                    auto tensorBlockMm5 = GetTile(tensorMm5, tla::MakeCoord(0, 0),
+                    auto tensorBlockMm4 = GetTile(tensorMm4, tla::MakeCoord(0, 0),
                                                 tla::MakeShape(actualBlockShape4.m(), actualBlockShape4.n()));
 
                     BlockMmadPart4 blockMmadPart4(resource);
-                    blockMmadPart4(tensorBlockDo, tensorBlockH, tensorBlockMm5, actualBlockShape4);
+                    blockMmadPart4(tensorBlockDo, tensorBlockH, tensorBlockMm4, actualBlockShape4);
                 }
+            }
+            WaitCredit();
+            for (uint32_t h = 0; h < params.HV; h++) {
                 // --- Part6: mm6 = ds_temp @ k -> wsMm6 ---
                 {
                     // GVA: k 为 HK 头
                     uint32_t hk_idx = h / params.n_ratio;
-                    uint64_t dsOffset = DqkwgBtbRingElemOffset(coreIdx, h, params.HV, params.BT);
+                    uint64_t dsOffset = DqkwgBtbElemOffset(coreIdx, h, params.HV, params.BT);
                     uint64_t kOffset = (hk_idx * params.T + bos_hk) * params.K;
-                    uint64_t mm6RingOffset = DqkwgBtxKRingElemOffset(coreIdx, h, params.HV, params.BT, params.K);
+                    uint64_t mm6Offset = DqkwgBtxKElemOffset(coreIdx, h, params.HV, params.BT, params.K);
 
                     auto tensorDsTemp = tla::MakeTensor(gmDsTemp[dsOffset], MakeLayoutFromTag(layoutBTxBT), Arch::PositionGM{});
                     auto tensorK = tla::MakeTensor(gmK[kOffset], MakeLayoutFromTag(layoutBTxK), Arch::PositionGM{});
-                    auto tensorMm6 = tla::MakeTensor(gmMm6[mm6RingOffset], MakeLayoutFromTag(layoutBTxK), Arch::PositionGM{});
+                    auto tensorMm6 = tla::MakeTensor(gmMm6[mm6Offset], MakeLayoutFromTag(layoutBTxK), Arch::PositionGM{});
 
                     auto tensorBlockDsTemp = GetTile(tensorDsTemp, tla::MakeCoord(0, 0),
                                                     tla::MakeShape(actualBlockShape6.m(), actualBlockShape6.k()));
@@ -514,39 +521,38 @@ public:
                 }
             }
             SetCubeReady();
-            WaitCredit();
             for (uint32_t h = 0; h < params.HV; h++) {
                 // --- Part5: dk_inner = v @ dh ---
                 {
                     uint64_t vOffset = (h * params.T + bos) * params.V;
                     uint64_t dhOffset = ((bIdx * params.HV + h) * params.numChunks + chunkIdx) * params.K * params.V;
-                    uint64_t mm6RingOffset = DqkwgBtxKRingElemOffset(coreIdx, h, params.HV, params.BT, params.K);
+                    uint64_t mm5Offset = DqkwgBtxKElemOffset(coreIdx, h, params.HV, params.BT, params.K);
 
                     auto tensorV = tla::MakeTensor(gmV[vOffset], MakeLayoutFromTag(layoutBTxV), Arch::PositionGM{});
                     auto tensorDh = tla::MakeTensor(gmDh[dhOffset], MakeLayoutFromTag(layoutVxK), Arch::PositionGM{});
-                    auto tensorMm6 = tla::MakeTensor(gmMm6[mm6RingOffset], MakeLayoutFromTag(layoutBTxK), Arch::PositionGM{});
+                    auto tensorMm5 = tla::MakeTensor(gmMm5[mm5Offset], MakeLayoutFromTag(layoutBTxK), Arch::PositionGM{});
                     
                     auto tensorBlockV = GetTile(tensorV, tla::MakeCoord(0, 0),
                                                 tla::MakeShape(actualBlockShape5.m(), actualBlockShape5.k()));
                     auto tensorBlockDh = GetTile(tensorDh, tla::MakeCoord(0, 0),
                                                     tla::MakeShape(actualBlockShape5.k(), actualBlockShape5.n()));
-                    auto tensorBlockMm6 = GetTile(tensorMm6, tla::MakeCoord(0, 0),
+                    auto tensorBlockMm5 = GetTile(tensorMm5, tla::MakeCoord(0, 0),
                                                     tla::MakeShape(actualBlockShape5.m(), actualBlockShape5.n()));
 
                     BlockMmadPart5 blockMmadPart5(resource);
-                    blockMmadPart5(tensorBlockV, tensorBlockDh, tensorBlockMm6, actualBlockShape5);
+                    blockMmadPart5(tensorBlockV, tensorBlockDh, tensorBlockMm5, actualBlockShape5);
                 }
                 // --- Part7: mm7 = ds_temp^T @ q -> wsMm7 (复用 wsMm5) ---
                 {
                     // GVA: q 为 HK 头
                     uint32_t hk_idx = h / params.n_ratio;
-                    uint64_t dsOffset = DqkwgBtbRingElemOffset(coreIdx, h, params.HV, params.BT);
+                    uint64_t dsOffset = DqkwgBtbElemOffset(coreIdx, h, params.HV, params.BT);
                     uint64_t qOffset = (hk_idx * params.T + bos_hk) * params.K;
-                    uint64_t mm7RingOffset = DqkwgBtxKRingElemOffset(coreIdx, h, params.HV, params.BT, params.K);
+                    uint64_t mm7Offset = DqkwgBtxKElemOffset(coreIdx, h, params.HV, params.BT, params.K);
 
                     auto tensorDsTemp =tla::MakeTensor(gmDsTemp[dsOffset], MakeLayoutFromTag(layoutBTxBT_T), Arch::PositionGM{});
                     auto tensorQ = tla::MakeTensor(gmQ[qOffset], MakeLayoutFromTag(layoutBTxK), Arch::PositionGM{});
-                    auto tensorMm7 = tla::MakeTensor(gmMm7[mm7RingOffset], MakeLayoutFromTag(layoutBTxK), Arch::PositionGM{});
+                    auto tensorMm7 = tla::MakeTensor(gmMm7[mm7Offset], MakeLayoutFromTag(layoutBTxK), Arch::PositionGM{});
 
                     auto tensorBlockDsTemp = GetTile(tensorDsTemp, tla::MakeCoord(0, 0),
                                                         tla::MakeShape(actualBlockShape7.m(), actualBlockShape7.k()));
@@ -561,9 +567,6 @@ public:
             }
             SetCubeReady();
         } // while group (chunk-group-major)
-
-        // 信用流水末尾余 1 个未消耗信用, cube WaitCredit/SetCubeReady 各 L 次。
-        WaitCredit();
     }
 };
 
@@ -616,11 +619,12 @@ private:
     bool isVarLen;
 
     // Workspace 偏移
-    uint64_t wsBtxKSyncSlotsPerHead;
-    uint64_t wsMm5Offset;
-    uint64_t wsDsTempOffset;
+    uint64_t wsMm3Offset;
+    uint64_t wsMm4Offset;
     uint64_t wsMm6Offset;
+    uint64_t wsMm5Offset;
     uint64_t wsMm7Offset;
+    uint64_t wsDsTempOffset;
 };
 
 template <typename DataType, typename GType>
@@ -637,10 +641,12 @@ __aicore__ inline void ChunkBwdDqkwgCubeProcess<DataType, GType>::Init(const Chu
     numChunks = tiling.numChunks;
     aicCoreNum = tiling.aicCoreNum;
     isVarLen = (tiling.isVarLen == 1);
-    wsMm5Offset = tiling.wsMm5Offset;
-    wsDsTempOffset = tiling.wsDsTempOffset;
+    wsMm3Offset = tiling.wsMm3Offset;
+    wsMm4Offset = tiling.wsMm4Offset;
     wsMm6Offset = tiling.wsMm6Offset;
+    wsMm5Offset = tiling.wsMm5Offset;
     wsMm7Offset = tiling.wsMm7Offset;
+    wsDsTempOffset = tiling.wsDsTempOffset;
 }
 
 template <typename DataType, typename GType>
@@ -741,16 +747,16 @@ __aicore__ inline void ChunkBwdDqkwgCubeProcess<DataType, GType>::Process()
         MatmulKernelTiled kernel;
         typename MatmulKernelTiled::Params params(ptrQ, ptrK, ptrV, ptrH, ptrDo, ptrDh, ptrDv, ptrCuSeqLen,
                                                   ptrChunkIndices, ptrDq, ptrDk, ptrDw, ptrWorkspace, B, HV, HK, T, K, V, BT,
-                                                  numChunks, n_ratio, isVarLen, wsMm5Offset,
-                                                  wsDsTempOffset, wsMm6Offset, wsMm7Offset);
+                                                  numChunks, n_ratio, isVarLen, wsMm3Offset, wsMm4Offset, wsMm6Offset,
+                                                  wsMm5Offset, wsMm7Offset, wsDsTempOffset);
         params.aicCoreNum = aicCoreNum;
         kernel(params);
     } else {
         MatmulKernel kernel;
         typename MatmulKernel::Params params(ptrQ, ptrK, ptrV, ptrH, ptrDo, ptrDh, ptrDv, ptrCuSeqLen, ptrChunkIndices,
                                              ptrDq, ptrDk, ptrDw, ptrWorkspace, B, HV, HK, T, K, V, BT, numChunks, n_ratio,
-                                             isVarLen, wsMm5Offset, wsDsTempOffset,
-                                             wsMm6Offset, wsMm7Offset);
+                                             isVarLen, wsMm3Offset, wsMm4Offset, wsMm6Offset, wsMm5Offset, 
+                                             wsMm7Offset, wsDsTempOffset);
         params.aicCoreNum = aicCoreNum;
         kernel(params);
     }

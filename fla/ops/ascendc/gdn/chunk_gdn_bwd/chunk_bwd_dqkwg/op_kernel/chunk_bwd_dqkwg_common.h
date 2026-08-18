@@ -54,17 +54,17 @@ constexpr int32_t LOG2_64 = 6;
 constexpr uint64_t SYNC_AIC_AIV_FLAG_0 = 5; // cube -> vector: 数据 ready (与基线一致)
 constexpr uint64_t SYNC_AIV_AIC_FLAG_0 = 3; // vector -> cube: 信用 credit (与基线一致)
 
-__aicore__ inline uint64_t DqkwgBtxKRingElemOffset(uint32_t coreIdx, uint32_t h, uint64_t H, uint64_t BT, uint64_t K)
+__aicore__ inline uint64_t DqkwgBtxKElemOffset(uint32_t coreIdx, uint32_t h, uint64_t H, uint64_t BT, uint64_t K)
 {
     return (coreIdx * H + (uint64_t)h) * (BT * K);
 }
 
-__aicore__ inline uint64_t DqkwgBtbRingElemOffset(uint32_t coreIdx, uint32_t h, uint64_t H, uint64_t BT)
+__aicore__ inline uint64_t DqkwgBtbElemOffset(uint32_t coreIdx, uint32_t h, uint64_t H, uint64_t BT)
 {
     return (coreIdx * H + (uint64_t)h) * (BT * BT);
 }
 
-__aicore__ inline uint64_t DqkwgScalarRingElemOffset(uint32_t coreIdx, uint32_t h, uint64_t H)
+__aicore__ inline uint64_t DqkwgScalarElemOffset(uint32_t coreIdx, uint32_t h, uint64_t H)
 {
     return coreIdx * H + (uint64_t)h;
 }

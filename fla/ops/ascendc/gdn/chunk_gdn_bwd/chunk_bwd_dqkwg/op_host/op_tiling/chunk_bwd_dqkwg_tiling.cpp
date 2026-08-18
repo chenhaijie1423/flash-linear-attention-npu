@@ -171,25 +171,25 @@ ASCENDC_EXTERN_C ge::graphStatus TilingChunkBwdDqkwg(gert::TilingContext* contex
         ringCoreSlots = 1;
     }
 
-    const size_t shortBtxKSize = align32(static_cast<size_t>(ringCoreSlots) * HV * BT * K * FP16_SIZE);
     const size_t sharedBtxKSize = align32(static_cast<size_t>(ringCoreSlots) * HV * BT * K * FP16_SIZE);
-    const size_t groupBtbSize = align32(static_cast<size_t>(ringCoreSlots) * HV * BT * BT * FP16_SIZE);
+    const size_t sharedBtbSize = align32(static_cast<size_t>(ringCoreSlots) * HV * BT * BT * FP16_SIZE);
     size_t dgLastSize = align32(static_cast<size_t>(ringCoreSlots) * HV * FP32_SIZE);
 
     size_t offset = 0;
+    size_t wsMm3Offset = offset;
+    offset += sharedBtbSize;
+    size_t wsMm4Offset = offset;
+    offset += sharedBtxKSize;
     size_t wsMm6Offset = offset;
-    offset += shortBtxKSize;
-
+    offset += sharedBtxKSize;
     size_t wsMm5Offset = offset;
     offset += sharedBtxKSize;
-
+    size_t wsMm7Offset = offset;
+    offset += sharedBtxKSize;
     size_t wsDsTempOffset = offset;
-    offset += groupBtbSize;
-
+    offset += sharedBtbSize;
     size_t wsDgLastOffset = offset;
     offset += dgLastSize;
-
-    size_t wsMm7Offset = wsMm5Offset;
     size_t totalUserWorkspace = offset;
 
     // 设置 workspace 大小
@@ -214,12 +214,13 @@ ASCENDC_EXTERN_C ge::graphStatus TilingChunkBwdDqkwg(gert::TilingContext* contex
     tilingData.set_mul0RowNum(V == 256 ? 16 : 32);
     tilingData.set_aicCoreNum(static_cast<uint32_t>(aicNum));
 
-    tilingData.set_wsDgLastOffset(wsDgLastOffset);
-    tilingData.set_dgLastSize(dgLastSize);
-    tilingData.set_wsMm5Offset(wsMm5Offset);
-    tilingData.set_wsDsTempOffset(wsDsTempOffset);
+    tilingData.set_wsMm3Offset(wsMm3Offset);
+    tilingData.set_wsMm4Offset(wsMm4Offset);
     tilingData.set_wsMm6Offset(wsMm6Offset);
+    tilingData.set_wsMm5Offset(wsMm5Offset);
     tilingData.set_wsMm7Offset(wsMm7Offset);
+    tilingData.set_wsDsTempOffset(wsDsTempOffset);
+    tilingData.set_wsDgLastOffset(wsDgLastOffset);
 
     // 检查是否有 cu_seqlens 输入来判断 IS_VARLEN
     tilingData.set_isVarLen(isVarLen);
