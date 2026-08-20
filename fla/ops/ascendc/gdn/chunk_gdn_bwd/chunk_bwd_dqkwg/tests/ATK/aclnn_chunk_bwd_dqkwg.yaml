@@ -4,10 +4,14 @@ version: v2.1
 name: aclnn.chunk.bwd.dqkwg
 aclnn_name: ChunkBwdDqkwg
 generate: generator_chunk_bwd_dqkwg
-dtype_numbers: 100
+dtype_numbers: 700
 extra_numbers: 0
 standard:
-  acc: cv_fused_double_benchmark
+  acc: 
+    cv_fused_double_benchmark:
+      max_re_ratio: 5
+      avg_re_ratio: 1.5
+      root_mean_squared_ratio: 1.5
 inputs:
   - name: q
     type: tensor
@@ -136,14 +140,14 @@ inputs:
       values: [int64]
     ranges:
       valid:
-        values: [ [ 1, 100 ] ]
+        values: [ [ 1, 4096 ] ]
       invalid:
         values: []
     shapes:
       dim_numbers:
         values: [ 1 ]
       dim_values:
-        values: [ [ 1, 100 ] ]
+        values: [ [ 1, 16 ] ]
   - name: chunk_indices
     type: tensor
     required: true

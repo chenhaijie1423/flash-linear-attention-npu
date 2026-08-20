@@ -398,7 +398,7 @@ public:
             {
                 BlockMmadPart7 blockMmadPart7(resource);
                 for (uint32_t h = 0; h < params.HV; h++) {
-                    // --- Part7: mm7 = ds_temp^T @ q -> wsMm7 (复用 wsMm5) ---
+                    // --- Part7: mm7 = ds_temp^T @ q -> wsMm7 ---
                     // GVA: q 为 HK 头
                     uint32_t hk_idx = h / params.n_ratio;
                     uint64_t dsOffset = DqkwgBtbElemOffset(coreIdx, h, params.HV, params.BT);

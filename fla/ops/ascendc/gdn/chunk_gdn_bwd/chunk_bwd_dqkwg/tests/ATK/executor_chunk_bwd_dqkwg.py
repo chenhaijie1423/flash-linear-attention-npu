@@ -8,7 +8,7 @@ from atk.configs.dataset_config import InputDataset
 from atk.configs.results_config import TaskResult
 from atk.tasks.api_execute import register
 from atk.tasks.api_execute.base_api import BaseApi
-
+from fla_npu.ops import ascendc as ascendc_ops
 
 # sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from chunk_bwd_dqkwg_cpu import chunk_bwd_dqkwg_cpu
@@ -208,9 +208,32 @@ class FunctionApi(BaseApi):
 
         return dq, dk, dw_out, dg
 
+    def npu_chunk_bwd_dqkwg(self, input_data: InputDataset, with_output: bool = False):
+        q = input_data.kwargs["q"]
+        k = input_data.kwargs["k"]
+        v = input_data.kwargs["v"]
+        do = input_data.kwargs["do"]
+        h = input_data.kwargs["h"]
+        dh = input_data.kwargs["dh"]
+        w = input_data.kwargs.get("w", None)
+        g = input_data.kwargs["g"]
+        dv = input_data.kwargs["dv"]
+        cu_seqlens = input_data.kwargs.get("cu_seqlens", None)
+        chunk_indices = input_data.kwargs.get("chunk_indices", None)
+        chunk_size = input_data.kwargs["chunk_size"]
+        scale = input_data.kwargs["scale"]
+
+        dq, dk, dw, dg = ascendc_ops.npu_chunk_bwd_dqkwg(
+            q, k, v, g, h, do, dh, dv, chunk_size, cu_seqlens=cu_seqlens, w=None, g_gamma=None, chunk_indices=chunk_indices, scale=scale, use_exp2=None, transpose_state_layout=None
+        )
+
+        return dq, dk, dw, dg
+
     def __call__(self, input_data: InputDataset, with_output: bool = False):
         q = input_data.kwargs["q"]
-        if q.dtype == torch.float64:
+        if self.device == "npu":
+            return self.npu_chunk_bwd_dqkwg(input_data, with_output)
+        elif q.dtype == torch.float64:
             return self.cpu_benchmark(input_data, with_output)
         else:
             return self.cpu(input_data, with_output)
@@ -291,7 +314,7 @@ class FunctionApi(BaseApi):
         dh = dh.to(qkv_type)
         g = g.to(g_type)
 
-        if self.device == "pyaclnn":
+        if self.device == "npu":
             q = q.npu()
             k = k.npu()
             v = v.npu()
@@ -301,10 +324,10 @@ class FunctionApi(BaseApi):
             g = g.npu()
             h = h.npu()
             dh = dh.npu()
-            # if cu_seqlens is not None:
-            #     cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int64, device=q.device)
-            # if chunk_indices is not None:
-            #     chunk_indices = torch.tensor(chunk_indices, dtype=torch.int64, device=q.device)
+            if cu_seqlens is not None:
+                cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int64, device=q.device)
+            if chunk_indices is not None:
+                chunk_indices = torch.tensor(chunk_indices, dtype=torch.int64, device=q.device)
 
         input_data.kwargs["q"] = q
         input_data.kwargs["k"] = k

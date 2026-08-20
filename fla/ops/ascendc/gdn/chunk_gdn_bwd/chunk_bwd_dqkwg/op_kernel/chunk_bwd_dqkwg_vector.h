@@ -570,27 +570,28 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessBVect
             Cast(tensorDsTempOut, tensorDsInFp32, RoundMode::CAST_RINT, actual_dsSize); // ds_temp -> fp16
             PipeBarrier<PIPE_V>();
 
-            // 列求和 -> [BT] (-Add0.D)
             // 行求和 -> [BT] (+Add0.C)
+            // 列求和 -> [BT] (-Add0.D)
             if (real_BT > FP32_PER_REPEAT) {
-                Add(tensorDgOut, tensorMm3InFp32, tensorMm3InFp32[BT], FP32_PER_REPEAT, real_BT - 1, {1, 1, 1, 0, 0, static_cast<uint8_t>(BT / 8)});
+                Add(tensorDsInFp32, tensorMm3InFp32, tensorMm3InFp32[FP32_PER_REPEAT], real_BT - FP32_PER_REPEAT, real_BT, {1, 1, 1, 8, 16, 16});
                 PipeBarrier<PIPE_V>();
-                Add(tensorDgOut[FP32_PER_REPEAT], tensorMm3InFp32[FP32_PER_REPEAT], tensorMm3InFp32[BT + FP32_PER_REPEAT], real_BT - FP32_PER_REPEAT, real_BT - 1, {1, 1, 1, 0, 0, static_cast<uint8_t>(BT / 8)});
+                WholeReduceSum(tensorDgOut, tensorDsInFp32, FP32_PER_REPEAT, real_BT, 1, 1, 8);
                 PipeBarrier<PIPE_V>();
 
-                Add(tensorMm3InFp32, tensorMm3InFp32, tensorMm3InFp32[FP32_PER_REPEAT], real_BT - FP32_PER_REPEAT, real_BT, {1, 1, 1, 8, 16, 16});
+                Add(tensorMm3InFp32, tensorMm3InFp32, tensorMm3InFp32[BT], FP32_PER_REPEAT, real_BT - 1, {1, 1, 1, 0, 0, static_cast<uint8_t>(BT / 8)});
                 PipeBarrier<PIPE_V>();
-                WholeReduceSum(tensorMm3InFp32, tensorMm3InFp32, FP32_PER_REPEAT, real_BT, 1, 1, 8);
+                Add(tensorMm3InFp32[FP32_PER_REPEAT], tensorMm3InFp32[FP32_PER_REPEAT], tensorMm3InFp32[BT + FP32_PER_REPEAT], real_BT - FP32_PER_REPEAT, real_BT - 1, {1, 1, 1, 0, 0, static_cast<uint8_t>(BT / 8)});
                 PipeBarrier<PIPE_V>();
             } else {
-                Add(tensorDgOut, tensorMm3InFp32, tensorMm3InFp32[BT], real_BT, real_BT - 1, {1, 1, 1, 0, 0, static_cast<uint8_t>(BT / 8)});
+                WholeReduceSum(tensorDgOut, tensorMm3InFp32, real_BT, real_BT, 1, 1, BT / 8);
                 PipeBarrier<PIPE_V>();
-
-                WholeReduceSum(tensorMm3InFp32, tensorMm3InFp32, real_BT, real_BT, 1, 1, BT / 8);
-                PipeBarrier<PIPE_V>();
+                if (real_BT > 1) {
+                    Add(tensorMm3InFp32, tensorMm3InFp32, tensorMm3InFp32[BT], real_BT, real_BT - 1, {1, 1, 1, 0, 0, static_cast<uint8_t>(BT / 8)});
+                    PipeBarrier<PIPE_V>();
+                }
             }
 
-            Sub(tensorDgOut, tensorMm3InFp32, tensorDgOut, real_BT);
+            Sub(tensorDgOut, tensorDgOut, tensorMm3InFp32, real_BT);
             PipeBarrier<PIPE_V>();
             if constexpr (!std::is_same<GType, float>::value) {
                 Cast(tensorDgOut.template ReinterpretCast<GType>(), tensorDgOut, RoundMode::CAST_RINT, real_BT);
