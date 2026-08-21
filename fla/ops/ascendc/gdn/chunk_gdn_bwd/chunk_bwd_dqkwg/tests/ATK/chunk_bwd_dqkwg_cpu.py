@@ -272,23 +272,9 @@ def chunk_bwd_dqkwg_cpu(
                 exp_gc = torch.exp(g_h)                              # [HV, L]
                 exp_neg_gc_glast = torch.exp(-g_h + g_last[:, None]) # [HV, L]
 
-                dq_from_state = dq_from_state * exp_gc[:, :, None] * scale
+                dq_from_state = dq_from_state * (exp_gc[:, :, None] * scale)
                 dk_from_state = dk_from_state * exp_neg_gc_glast[:, :, None]
                 timer.stop("decay_scale")
-
-                # b_dg += sum(b_dq * b_q) ; b_dg -= sum(b_k * b_dk)
-                # 保留显式 product+sum（与原参考一致，避免 einsum 改变归约顺序）
-                timer.start("dg_state")
-                dg_c = (dq_from_state * q_h).sum(dim=-1)             # [HV, L]
-                dg_c = cast_round(dg_c)
-                dg_c = dg_c - (k_h * dk_from_state).sum(dim=-1)      # [HV, L]
-                dg_c = cast_round(dg_c)
-
-                # b_dg_last += sum(h * dh) * exp(g_last) + sum(dk * k)
-                # 注意 h_prev/dh_curr 保留原始 datatype（与原实现一致）
-                dg_last_accum = (h_prev * dh_curr).sum(dim=(-1, -2)) * torch.exp(g_last)  # [HV]
-                dg_last_accum = dg_last_accum + (dk_from_state * k_h).sum(dim=(-1, -2))   # [HV]
-                timer.stop("dg_state")
 
                 # -----------------------------------------------------------
                 # 3. Intra-chunk Attention
@@ -297,29 +283,44 @@ def chunk_bwd_dqkwg_cpu(
                 ds = cast_round(torch.bmm(do_h, v_h.transpose(1, 2)))  # [HV, L, L]
                 timer.stop("bmm_intra_ds")
                 timer.start("decay_apply")
-                decay_mat = torch.exp(g_h[:, :, None] - g_h[:, None, :])  # [HV, L, L]
+                decay_mat = torch.exp(torch.min(g_h[:, :, None] - g_h[:, None, :], torch.tensor(0)))  # [HV, L, L]
                 # 融合：避免 where(scalar) 类型提升与多次临时分配
                 ds = ds * decay_mat
                 ds = ds * mask_f                  # [1, L, L] 广播掩码
                 ds = ds * scale
                 timer.stop("decay_apply")
 
-                # b_ds2 = b_ds * (q @ k.T)
                 timer.start("bmm_qk")
                 qk_t = cast_round(torch.bmm(q_h, k_h.transpose(1, 2)))   # [HV, L, L]
-                timer.stop("bmm_qk")
-                timer.start("dg_intra_accum")
+
                 ds2 = ds * qk_t
-                dg_c = dg_c + ds2.sum(dim=-1)
+                dg_c = ds2.sum(dim=-1)
                 dg_c = dg_c - ds2.sum(dim=-2)
                 if datatype == gtype:
                     dg_c = dg_c.to(gtype)                               # 等价 .to(datatype).to(gtype)
                 else:
                     dg_c = dg_c.to(datatype).to(gtype)                  # [HV, L]
+                timer.stop("bmm_qk")
 
+                # b_dg += sum(b_dq * b_q) ; b_dg -= sum(b_k * b_dk)
+                # 保留显式 product+sum（与原参考一致，避免 einsum 改变归约顺序）
+                timer.start("dg_state")
+                dg_c = cast_round(dg_c)
+                dg_c += (dq_from_state * q_h).sum(dim=-1)             # [HV, L]
+                dg_c = cast_round(dg_c)
+                dg_c = dg_c - (k_h * dk_from_state).sum(dim=-1)      # [HV, L]
+
+                # b_dg_last += sum(h * dh) * exp(g_last) + sum(dk * k)
+                # 注意 h_prev/dh_curr 保留原始 datatype（与原实现一致）
+                dg_last_accum = (h_prev * dh_curr).sum(dim=(-1, -2)) * torch.exp(g_last)  # [HV]
+                dg_last_accum = dg_last_accum + (dk_from_state * k_h).sum(dim=(-1, -2))   # [HV]
+                timer.stop("dg_state")
+
+                # b_ds2 = b_ds * (q @ k.T)
+                timer.start("dg_intra_accum")
                 # 仅块最后一个有效 token 累加 dg_last
-                dg_c[:, L - 1] = dg_c[:, L - 1] + dg_last_accum.to(gtype)
-                dg[b_idx, s:e, :] = dg_c.permute(1, 0)                   # [L, HV]
+                dg_c[:, L - 1] = dg_c[:, L - 1] + dg_last_accum
+                dg[b_idx, s:e, :] = dg_c.to(gtype).permute(1, 0)                   # [L, HV]
                 timer.stop("dg_intra_accum")
 
                 # -----------------------------------------------------------
@@ -432,27 +433,16 @@ def chunk_bwd_dqkwg_cpu(
             g_last = g_b.reshape(N, H, C)[:, :, C - 1].reshape(N * H)                          # [N*H]
             exp_gc = torch.exp(g_b)                                                             # [N*H, C]
             exp_neg_gc_glast = torch.exp(-g_b + g_last[:, None])                               # [N*H, C]
-            dq_state = dq_state * exp_gc[:, :, None] * scale
+            dq_state = dq_state * (exp_gc[:, :, None] * scale)
             dk_state = dk_state * exp_neg_gc_glast[:, :, None]
             timer.stop("batched_decay_scale")
-
-            # ---- dg_state（显式 product+sum，与原参考一致）----
-            timer.start("batched_dg_state")
-            dg_c = (dq_state * q_b).sum(dim=-1)                                              # [N*H, C]
-            dg_c = cast_round(dg_c)
-            dg_c = dg_c - (k_b * dk_state).sum(dim=-1)
-            dg_c = cast_round(dg_c)
-            # h_prev*dh_curr 保留原始 datatype（与原实现一致）
-            dg_last_accum = (h_b * dh_b).sum(dim=(-1, -2)) * torch.exp(g_last)                # [N*H]
-            dg_last_accum = dg_last_accum + (dk_state * k_b).sum(dim=(-1, -2))                # [N*H]
-            timer.stop("batched_dg_state")
 
             # ---- 3. Intra-chunk attention ----
             timer.start("batched_bmm_intra_ds")
             ds = cast_round(torch.bmm(do_b, v_b.transpose(1, 2)))                              # [N*H, C, C]
             timer.stop("batched_bmm_intra_ds")
             timer.start("batched_decay_apply")
-            decay_mat = torch.exp(g_b[:, :, None] - g_b[:, None, :])                           # [N*H, C, C]
+            decay_mat = torch.exp(torch.min(g_b[:, :, None] - g_b[:, None, :], torch.tensor(0)))                           # [N*H, C, C]
             ds = ds * decay_mat
             ds = ds * mask_f
             ds = ds * scale
@@ -460,20 +450,28 @@ def chunk_bwd_dqkwg_cpu(
 
             timer.start("batched_bmm_qk")
             qk_t = cast_round(torch.bmm(q_b, k_b.transpose(1, 2)))                             # [N*H, C, C]
-            timer.stop("batched_bmm_qk")
-            timer.start("batched_dg_intra_accum")
             ds2 = ds * qk_t
-            dg_c = dg_c + ds2.sum(dim=-1)
+            dg_c = ds2.sum(dim=-1)
             dg_c = dg_c - ds2.sum(dim=-2)
-            if datatype == gtype:
-                dg_c = dg_c.to(gtype)
-            else:
-                dg_c = dg_c.to(datatype).to(gtype)
+            timer.stop("batched_bmm_qk")
+
+            # ---- dg_state（显式 product+sum，与原参考一致）----
+            timer.start("batched_dg_state")
+            dg_c = cast_round(dg_c)
+            dg_c += (dq_state * q_b).sum(dim=-1)                                              # [N*H, C]
+            dg_c = cast_round(dg_c)
+            dg_c = dg_c - (k_b * dk_state).sum(dim=-1)
+            # h_prev*dh_curr 保留原始 datatype（与原实现一致）
+            dg_last_accum = (h_b * dh_b).sum(dim=(-1, -2)) * torch.exp(g_last)                # [N*H]
+            dg_last_accum = dg_last_accum + (dk_state * k_b).sum(dim=(-1, -2))                # [N*H]
+            timer.stop("batched_dg_state")
+
             # 每个 chunk 第 C-1 个位置累加 dg_last
+            timer.start("batched_dg_intra_accum")
             dg_c = dg_c.reshape(N, H, C)
-            dg_c[:, :, C - 1] = dg_c[:, :, C - 1] + dg_last_accum.to(gtype).reshape(N, H)
+            dg_c[:, :, C - 1] = dg_c[:, :, C - 1] + dg_last_accum.reshape(N, H)
             # [N, H, C] -> [N, C, H] -> [N*C, H]
-            dg[b_idx, s0:s0 + N * C, :] = dg_c.permute(0, 2, 1).reshape(N * C, H)
+            dg[b_idx, s0:s0 + N * C, :] = dg_c.to(gtype).permute(0, 2, 1).reshape(N * C, H)
             timer.stop("batched_dg_intra_accum")
 
             # ---- 4. dq/dk intra ----

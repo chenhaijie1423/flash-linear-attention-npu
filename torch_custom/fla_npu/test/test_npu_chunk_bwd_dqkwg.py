@@ -45,6 +45,22 @@ def compare_data(golden_out, npu_out, threshold):
     b = npu_out.cpu().reshape(1, npu_out.numel())[0]
     diff = torch.abs(a - b) / torch.max(torch.abs(a), torch.tensor(1))
 
+    # 处理 inf 情况：同号 inf 视为相等算通过，inf 与正常值（或异号 inf）算失败
+    a_inf = torch.isinf(a)
+    b_inf = torch.isinf(b)
+    both_inf_same_sign = a_inf & b_inf & (torch.sign(a) == torch.sign(b))
+    inf_mismatch = a_inf != b_inf
+    diff = torch.where(both_inf_same_sign, torch.zeros_like(diff), diff)
+    diff = torch.where(inf_mismatch, torch.full_like(diff, float('inf')), diff)
+
+    # 处理 nan 情况：同为 nan 视为相等算通过，nan 与非 nan（正常值或 inf）算失败
+    a_nan = torch.isnan(a)
+    b_nan = torch.isnan(b)
+    both_nan = a_nan & b_nan
+    nan_mismatch = a_nan != b_nan
+    diff = torch.where(both_nan, torch.zeros_like(diff), diff)
+    diff = torch.where(nan_mismatch, torch.full_like(diff, float('inf')), diff)
+
     max_diff, max_index = torch.max(diff, dim = 0)
     c = max_diff < threshold
     print("阈值为：", threshold)

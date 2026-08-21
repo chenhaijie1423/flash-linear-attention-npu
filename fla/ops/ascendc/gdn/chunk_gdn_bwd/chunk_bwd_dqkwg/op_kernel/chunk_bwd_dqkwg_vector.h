@@ -573,7 +573,7 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessBVect
             // 行求和 -> [BT] (+Add0.C)
             // 列求和 -> [BT] (-Add0.D)
             if (real_BT > FP32_PER_REPEAT) {
-                DataCopy(tensorDsInFp32, tensorMm3InFp32, {static_cast<uint16_t>(real_BT), 8, 16, 8});
+                DataCopy(tensorDsInFp32, tensorMm3InFp32, {static_cast<uint16_t>(real_BT), 8, 8, 0});
                 PipeBarrier<PIPE_V>();
                 Add(tensorDsInFp32, tensorDsInFp32, tensorMm3InFp32[FP32_PER_REPEAT], real_BT - FP32_PER_REPEAT, real_BT, {1, 1, 1, 8, 8, 16});
                 PipeBarrier<PIPE_V>();
