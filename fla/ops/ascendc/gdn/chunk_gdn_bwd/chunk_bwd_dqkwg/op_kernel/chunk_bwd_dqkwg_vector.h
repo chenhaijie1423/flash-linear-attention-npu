@@ -636,6 +636,9 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessCVect
 
         // CopyIn: dq_inner, q, g, dg
         {
+            TEventID eventId = GetTPipePtr()->FetchEventID(HardEvent::V_MTE2);
+            SetFlag<HardEvent::V_MTE2>(eventId);
+            WaitFlag<HardEvent::V_MTE2>(eventId);
             auto tensorDqIn = inQue1.AllocTensor<DataType>();
             auto tensorQIn = inQue2.AllocTensor<DataType>();
             auto tensorGIn = inQue3.AllocTensor<GType>();
@@ -756,6 +759,9 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessCVect
 
         // CopyIn: g, dg
         {
+            TEventID eventId = GetTPipePtr()->FetchEventID(HardEvent::V_MTE2);
+            SetFlag<HardEvent::V_MTE2>(eventId);
+            WaitFlag<HardEvent::V_MTE2>(eventId);
             auto tensorGIn = inQue3.AllocTensor<GType>();
             auto tensorDgIn = inQue4.AllocTensor<GType>();
             if constexpr (std::is_same<GType, float>::value) {

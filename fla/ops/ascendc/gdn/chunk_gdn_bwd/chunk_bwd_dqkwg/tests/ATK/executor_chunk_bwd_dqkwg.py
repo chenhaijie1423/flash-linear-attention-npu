@@ -263,14 +263,14 @@ class FunctionApi(BaseApi):
             num_chunks = len(chunk_indices) // 2
             # q, k: [B, HK, T, K]; v, dox, dv: [B, HV, T, V]
             # g: [B, HV, T]; h, dh: [B, HV, num_chunks, K, V]
-            q = torch.rand(B, HK, T, K, dtype=torch.bfloat16).to(qkv_type)
-            k = torch.rand(B, HK, T, K, dtype=torch.bfloat16).to(qkv_type)
-            v = torch.rand(B, HV, T, V, dtype=torch.bfloat16).to(qkv_type)
-            do = torch.rand(B, HV, T, V, dtype=torch.bfloat16).to(qkv_type)
-            dv = torch.rand(B, HV, T, V, dtype=torch.bfloat16).to(qkv_type)
+            q = (torch.rand(B, HK, T, K, dtype=torch.bfloat16) * 5e-2).to(qkv_type)
+            k = (torch.rand(B, HK, T, K, dtype=torch.bfloat16) * 5e-2).to(qkv_type)
+            v = (torch.rand(B, HV, T, V, dtype=torch.bfloat16) * 5e-2).to(qkv_type)
+            do = (torch.rand(B, HV, T, V, dtype=torch.bfloat16) * 5e-2).to(qkv_type)
+            dv = (torch.rand(B, HV, T, V, dtype=torch.bfloat16) * 5e-1).to(qkv_type)
             g = create_gate_g(B, HV, T, torch.bfloat16).to(g_type)
-            h = torch.rand(B, HV, num_chunks, K, V, dtype=torch.bfloat16).to(qkv_type)
-            dh = torch.rand(B, HV, num_chunks, K, V, dtype=torch.bfloat16).to(qkv_type)
+            h = (torch.rand(B, HV, num_chunks, K, V, dtype=torch.bfloat16) * 5e-2).to(qkv_type)
+            dh = (torch.rand(B, HV, num_chunks, K, V, dtype=torch.bfloat16) * 5e-2).to(qkv_type)
         else:
             cu_seqlens = None
             chunk_indices = None
@@ -278,17 +278,17 @@ class FunctionApi(BaseApi):
             T = T_json
             dtype = qkv_type
             Gtype = g_type
-            q = torch.randn(B,HK,T,K, dtype=torch.bfloat16).to(qkv_type)
-            k = torch.randn(B,HK,T,K, dtype=torch.bfloat16).to(qkv_type)
-            v = torch.randn(B,HV,T,V, dtype=torch.bfloat16).to(qkv_type)
+            q = (torch.randn(B,HK,T,K, dtype=torch.bfloat16) * 5e-2).to(qkv_type)
+            k = (torch.randn(B,HK,T,K, dtype=torch.bfloat16) * 5e-2).to(qkv_type)
+            v = (torch.randn(B,HV,T,V, dtype=torch.bfloat16) * 5e-2).to(qkv_type)
 
             g = create_gate_g(B, HV, T, torch.bfloat16).to(g_type)    #G必须递减且为负数
-            do = torch.randn(B,HV,T,V, dtype=torch.bfloat16).to(qkv_type)
+            do = (torch.randn(B,HV,T,V, dtype=torch.bfloat16) * 5e-2).to(qkv_type)
             
-            dv = torch.randn(B,HV,T,V, dtype=torch.bfloat16).to(qkv_type)
+            dv = (torch.randn(B,HV,T,V, dtype=torch.bfloat16) * 5e-1).to(qkv_type)
 
-            h = torch.randn(B, HV, num_chunks, K, V, dtype=torch.bfloat16).to(qkv_type)
-            dh = torch.randn(B, HV, num_chunks, K, V, dtype=torch.bfloat16).to(qkv_type)
+            h = (torch.randn(B, HV, num_chunks, K, V, dtype=torch.bfloat16) * 5e-2).to(qkv_type)
+            dh = (torch.randn(B, HV, num_chunks, K, V, dtype=torch.bfloat16) * 5e-2).to(qkv_type)
 
         if self.device == "npu":
             q = q.npu()
