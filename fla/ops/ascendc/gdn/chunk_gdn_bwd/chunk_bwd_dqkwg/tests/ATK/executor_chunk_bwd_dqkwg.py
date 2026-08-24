@@ -231,6 +231,7 @@ class FunctionApi(BaseApi):
             return self.cpu(input_data, with_output)
 
     def init_by_input_data(self, input_data: InputDataset):
+        torch.manual_seed(self.task_result.case_config.id)
         B, HK, T_json, K = input_data.kwargs["q"].shape
         HV = input_data.kwargs["v"].shape[1]
         V = input_data.kwargs["v"].shape[3]
