@@ -283,6 +283,7 @@ public:
                 }
             }
             SetCubeReady();
+            WaitClear();
             {
             // --- Part2: mm3 = q @ k^T -> wsMm3 (B_vector 在后续 stage 消费) ---
                 BlockMmadPart2 blockMmadPart2(resource);
@@ -327,6 +328,7 @@ public:
                 }
             }
             SetCubeReady();
+            WaitClear();
             {
                 BlockMmadPart4 blockMmadPart4(resource);
                 for (uint32_t h = 0; h < params.HV; h++) {
@@ -374,6 +376,7 @@ public:
                 }
             }
             SetCubeReady();
+            WaitClear();
             {
                 BlockMmadPart5 blockMmadPart5(resource);
                 for (uint32_t h = 0; h < params.HV; h++) {
@@ -420,6 +423,10 @@ public:
             }
             SetCubeReady();
         } // while group (chunk-group-major)
+        // 信号一一对应，后置消耗，与vec预置对应
+        WaitClear();
+        WaitClear();
+        WaitClear();
     }
 };
 

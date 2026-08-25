@@ -53,6 +53,7 @@ constexpr int32_t LOG2_64 = 6;
 // ============================================================================
 constexpr uint64_t SYNC_AIC_AIV_FLAG_0 = 5; // cube -> vector: 数据 ready (与基线一致)
 constexpr uint64_t SYNC_AIV_AIC_FLAG_0 = 3; // vector -> cube: 信用 credit (与基线一致)
+constexpr uint64_t SYNC_AIV_AIC_FLAG_1 = 4; // vector -> cube: 数据 clear
 
 __aicore__ inline uint64_t DqkwgBtxKElemOffset(uint32_t coreIdx, uint32_t h, uint64_t H, uint64_t BT, uint64_t K)
 {
@@ -78,6 +79,10 @@ __aicore__ inline void WaitCredit()
 {
     CrossCoreWaitFlag(SYNC_AIV_AIC_FLAG_0);
 }
+__aicore__ inline void WaitClear()
+{
+    CrossCoreWaitFlag(SYNC_AIV_AIC_FLAG_1);
+}
 // vector 端: 等待 cube ready (MTE2 读 GM 前) / 回一个信用 (MTE3 写 GM 后)
 __aicore__ inline void WaitCubeReady()
 {
@@ -86,6 +91,10 @@ __aicore__ inline void WaitCubeReady()
 __aicore__ inline void SetVecCredit()
 {
     CrossCoreSetFlag<0x2, PIPE_MTE3>(SYNC_AIV_AIC_FLAG_0);
+}
+__aicore__ inline void SetVecClear()
+{
+    CrossCoreSetFlag<0x2, PIPE_MTE3>(SYNC_AIV_AIC_FLAG_1);
 }
 
 constexpr uint32_t FP32_PER_REPEAT = 64;
