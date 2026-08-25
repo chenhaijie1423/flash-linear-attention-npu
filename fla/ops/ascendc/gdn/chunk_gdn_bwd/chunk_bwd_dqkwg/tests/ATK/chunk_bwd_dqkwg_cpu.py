@@ -102,6 +102,35 @@ def chunk_bwd_dqkwg_cpu(
         datatype = torch.float64
         gtype = torch.float64
 
+    # ---- Pad T to multiple of chunk_size (dense mode only) ----
+    # 消除 ragged 尾部，使所有 chunk 都是满长度，统一走 batched 路径。
+    # q/k/v/do/dv 补零；g 补最后一个有效值（保持单调递减语义）。
+    # padding 位置的贡献天然为零（do=0 → ds 行为零；v=0 → ds 列为零）。
+    # 唯一需要特殊处理的是 dg_last_accum 的位置：
+    #   满 chunk → 加到 C-1；padded tail → 加到 L_orig-1（而非 C-1）。
+    C = chunk_size
+    T_orig = T
+    ragged_len = (T % C) if cu_seqlens is None else 0
+    pad_T = (C - ragged_len) % C if ragged_len > 0 else 0
+    if pad_T > 0:
+        q = torch.nn.functional.pad(q, (0, 0, 0, 0, 0, pad_T))
+        k = torch.nn.functional.pad(k, (0, 0, 0, 0, 0, pad_T))
+        v = torch.nn.functional.pad(v, (0, 0, 0, 0, 0, pad_T))
+        do = torch.nn.functional.pad(do, (0, 0, 0, 0, 0, pad_T))
+        dv = torch.nn.functional.pad(dv, (0, 0, 0, 0, 0, pad_T))
+        g = torch.cat([g, g[:, -1:, :].expand(-1, pad_T, -1)], dim=1)
+        T = T + pad_T
+
+    # ---- Pre-transpose + pre-cast ----
+    timer.start("pre_transpose")
+    q_ct = q.permute(0, 2, 1, 3).to(calc_type).contiguous()   # [B, HK, T, K]
+    k_ct = k.permute(0, 2, 1, 3).to(calc_type).contiguous()   # [B, HK, T, K]
+    v_ct = v.permute(0, 2, 1, 3).to(calc_type).contiguous()   # [B, HV, T, V]
+    do_ct = do.permute(0, 2, 1, 3).to(calc_type).contiguous() # [B, HV, T, V]
+    dv_ct = dv.permute(0, 2, 1, 3).to(calc_type).contiguous() # [B, HV, T, V]
+    g_ct = g.permute(0, 2, 1).contiguous()                    # [B, HV, T], gtype
+    timer.stop("pre_transpose")
+
     # Keep per-value-head contributions first, then reduce them into key heads.
     timer.start("alloc")
     dq_hv = torch.zeros((B, T, HV, K), dtype=datatype)
@@ -162,11 +191,10 @@ def chunk_bwd_dqkwg_cpu(
             # q/k: [L, HK, K] -> [HK, L, K] -> 复制 n_ratio 份 -> [HV, L, K]
             #   head h_idx 对应 hk_idx = h_idx // n_ratio（与原循环一致）
             timer.start("data_prep")
-            q_h = expand_heads(q[b_idx, s:e, :, :].permute(1, 0, 2).to(calc_type))
-            k_h = expand_heads(k[b_idx, s:e, :, :].permute(1, 0, 2).to(calc_type))
-            # v/do: [L, HV, V] -> [HV, L, V]
-            v_h = v[b_idx, s:e, :, :].permute(1, 0, 2).to(calc_type)
-            do_h = do[b_idx, s:e, :, :].permute(1, 0, 2).to(calc_type)
+            q_h = expand_heads(q_ct[b_idx, :, s:e, :])
+            k_h = expand_heads(k_ct[b_idx, :, s:e, :])
+            v_h = v_ct[b_idx, :, s:e, :]
+            do_h = do_ct[b_idx, :, s:e, :]
             # h/dh: [HV, K, V]（保留原始 datatype，供 dg_last_accum 使用）
             h_prev = h[b_idx, i_t + chunk_start_idx, :, :, :]       # [HV, K, V]
             dh_curr = dh[b_idx, i_t + chunk_start_idx, :, :, :]     # [HV, K, V]
@@ -185,7 +213,7 @@ def chunk_bwd_dqkwg_cpu(
 
             # b_dw += dot(b_dv, b_h) (kernel 存 -b_dw)
             timer.start("bmm_dw")
-            dv_h = dv[b_idx, s:e, :, :].permute(1, 0, 2).to(calc_type)
+            dv_h = dv_ct[b_idx, :, s:e, :]
             dw_c = cast_round(torch.bmm(dv_h, h_prev_t))       # [HV, L, K]
             dw[b_idx, s:e, :, :] = (-dw_c).permute(1, 0, 2)
             timer.stop("bmm_dw")
@@ -198,8 +226,8 @@ def chunk_bwd_dqkwg_cpu(
             # 2. Gating / Decay Logic Preparation
             # -----------------------------------------------------------
             timer.start("decay_scale")
-            g_h = g[b_idx, s:e, :].permute(1, 0)                # [HV, L] (gtype)
-            g_last = g[b_idx, min(s + chunk_size, t_end) - 1, :]  # [HV]
+            g_h = g_ct[b_idx, :, s:e]                            # [HV, L] (gtype)
+            g_last = g_ct[b_idx, :, min(s + chunk_size, t_end) - 1]  # [HV]
 
             exp_gc = torch.exp(g_h)                              # [HV, L]
             exp_neg_gc_glast = torch.exp(-g_h + g_last[:, None]) # [HV, L]
@@ -280,14 +308,16 @@ def chunk_bwd_dqkwg_cpu(
             timer.stop("write_back")
 
     # ------------------------------------------------------------------
-    # 批量 dense 路径：把同一 b 下所有满 chunk（长度 == chunk_size）合并成
+    # 批量 dense 路径：把同一 b 下所有 chunk（含 padded tail）合并成
     # 一次大 bmm，消除 Python chunk 循环与算子派发开销。
-    # 仅当 cu_seqlens is None 且存在满 chunk 时启用；不足 chunk_size 的尾部
-    # 仍走逐 chunk 的 process_sequence（保证 ragged/varlen 正确性）。
+    # ragged tail 在函数入口已 pad 到 chunk_size；padding 位置贡献为零
+    #（do=0/v=0 → ds=0/dq=0/dk=0），唯一需修正的是 dg_last_accum 的位置：
+    # padded tail 的 dg_last_accum 加到 ragged_len-1 而非 C-1。
     # chunk 之间无数据依赖（h/dh 是只读输入，dq_hv 等只写不跨 chunk 读），
     # 故改变 chunk 处理顺序不改变结果；单个 chunk 内运算顺序保持不变。
     # ------------------------------------------------------------------
-    def process_dense_batched(b_idx: int, n_full: int, t_offset: int, h_offset: int):
+    def process_dense_batched(b_idx: int, n_full: int, t_offset: int, h_offset: int,
+                              ragged_len: int = 0):
         nonlocal chunk_count
         N = n_full
         if N <= 0:
@@ -298,20 +328,20 @@ def chunk_bwd_dqkwg_cpu(
         chunk_count += N
         timer.start("batched_total")
 
-        # ---- 数据准备：把 [N*C, ...] 重排为 [N*HV, C, ...] ----
+        # ---- 数据准备：从 pre-transposed tensors 切片，无需 permute+cast ----
         timer.start("batched_data_prep")
-        # q/k: [N*C, HK, K] -> [N, C, HK, K] -> [N, HK, C, K] -> [N*HV, C, K]
-        q_b = q[b_idx, s0:s0 + N * C, :, :].view(N, C, HK, K).permute(0, 2, 1, 3)
+        # q/k: [B, HK, T, K] -> [HK, N*C, K] -> [HK, N, C, K] -> [N, HK, C, K]
+        q_b = q_ct[b_idx, :, s0:s0 + N * C, :].reshape(HK, N, C, K).permute(1, 0, 2, 3)
         if n_ratio > 1:
             q_b = q_b.repeat_interleave(n_ratio, dim=1)           # [N, HV, C, K]
-        q_b = q_b.reshape(N * H, C, K).to(calc_type)
-        k_b = k[b_idx, s0:s0 + N * C, :, :].view(N, C, HK, K).permute(0, 2, 1, 3)
+        q_b = q_b.reshape(N * H, C, K)
+        k_b = k_ct[b_idx, :, s0:s0 + N * C, :].reshape(HK, N, C, K).permute(1, 0, 2, 3)
         if n_ratio > 1:
             k_b = k_b.repeat_interleave(n_ratio, dim=1)
-        k_b = k_b.reshape(N * H, C, K).to(calc_type)
-        # v/do: [N*C, HV, V] -> [N, HV, C, V] -> [N*HV, C, V]
-        v_b = v[b_idx, s0:s0 + N * C, :, :].view(N, C, H, V).permute(0, 2, 1, 3).reshape(N * H, C, V).to(calc_type)
-        do_b = do[b_idx, s0:s0 + N * C, :, :].view(N, C, H, V).permute(0, 2, 1, 3).reshape(N * H, C, V).to(calc_type)
+        k_b = k_b.reshape(N * H, C, K)
+        # v/do: [B, HV, T, V] -> [HV, N*C, V] -> [HV, N, C, V] -> [N, HV, C, V] -> [N*HV, C, V]
+        v_b = v_ct[b_idx, :, s0:s0 + N * C, :].reshape(H, N, C, V).permute(1, 0, 2, 3).reshape(N * H, C, V)
+        do_b = do_ct[b_idx, :, s0:s0 + N * C, :].reshape(H, N, C, V).permute(1, 0, 2, 3).reshape(N * H, C, V)
         # h/dh: [N, HV, K, V]（原始 datatype 保留，供 dg_last_accum）
         h_b = h[b_idx, h_offset:h_offset + N, :, :, :].reshape(N * H, K, V)
         dh_b = dh[b_idx, h_offset:h_offset + N, :, :, :].reshape(N * H, K, V)
@@ -326,7 +356,7 @@ def chunk_bwd_dqkwg_cpu(
         timer.stop("batched_bmm_state")
 
         timer.start("batched_bmm_dw")
-        dv_b = dv[b_idx, s0:s0 + N * C, :, :].view(N, C, H, V).permute(0, 2, 1, 3).reshape(N * H, C, V).to(calc_type)
+        dv_b = dv_ct[b_idx, :, s0:s0 + N * C, :].reshape(H, N, C, V).permute(1, 0, 2, 3).reshape(N * H, C, V)
         dw_c = cast_round(torch.bmm(dv_b, h_b_t))            # [N*H, C, K]
         # [N*H, C, K] -> [N, H, C, K] -> [N, C, H, K] -> [N*C, H, K]
         dw_neg = (-dw_c).reshape(N, H, C, K).permute(0, 2, 1, 3).reshape(N * C, H, K)
@@ -339,8 +369,8 @@ def chunk_bwd_dqkwg_cpu(
 
         # ---- 2. Decay scale ----
         timer.start("batched_decay_scale")
-        # g: [N*C, HV] -> [N, HV, C] -> [N*HV, C]
-        g_b = g[b_idx, s0:s0 + N * C, :].view(N, C, H).permute(0, 2, 1).reshape(N * H, C)  # gtype
+        # g: pre-transposed [B, HV, T] -> [HV, N*C] -> [HV, N, C] -> [N, HV, C] -> [N*HV, C]
+        g_b = g_ct[b_idx, :, s0:s0 + N * C].reshape(H, N, C).permute(1, 0, 2).reshape(N * H, C)  # gtype
         # 每个 chunk 的最后有效 token = chunk 内第 C-1 个位置（满 chunk 下成立）
         g_last = g_b.reshape(N, H, C)[:, :, C - 1].reshape(N * H)                          # [N*H]
         exp_gc = torch.exp(g_b)                                                             # [N*H, C]
@@ -354,7 +384,10 @@ def chunk_bwd_dqkwg_cpu(
         ds = cast_round(torch.bmm(do_b, v_b.transpose(1, 2)))                              # [N*H, C, C]
         timer.stop("batched_bmm_intra_ds")
         timer.start("batched_decay_apply")
-        decay_mat = torch.exp(torch.min(g_b[:, :, None] - g_b[:, None, :], torch.tensor(0)))                           # [N*H, C, C]
+        # 用 clamp 替代 min(tensor, scalar)，避免每 chunk 创建标量张量
+        # in-place exp_ 节省一次 [N*H, C, C] 分配
+        g_diff = g_b[:, :, None] - g_b[:, None, :]
+        decay_mat = torch.clamp(g_diff, max=0).exp_()                                      # [N*H, C, C]
         ds = ds * decay_mat
         ds = ds * mask_f
         ds = ds * scale
@@ -380,10 +413,18 @@ def chunk_bwd_dqkwg_cpu(
         dg_last_accum = dg_last_accum + k_dk_prod.sum(dim=(-1, -2))                      # [N*H]
         timer.stop("batched_dg_state")
 
-        # 每个 chunk 第 C-1 个位置累加 dg_last
+        # 每个 chunk 累加 dg_last：
+        #   满 chunk → 加到 C-1；padded tail → 加到 ragged_len-1（原始最后有效 token）
         timer.start("batched_dg_intra_accum")
         dg_c = dg_c.reshape(N, H, C)
-        dg_c[:, :, C - 1] = dg_c[:, :, C - 1] + dg_last_accum.reshape(N, H)
+        dg_last_reshaped = dg_last_accum.reshape(N, H)
+        if ragged_len > 0 and N > 1:
+            dg_c[:N-1, :, C - 1] += dg_last_reshaped[:N-1]
+            dg_c[N-1, :, ragged_len - 1] += dg_last_reshaped[N-1]
+        elif ragged_len > 0:
+            dg_c[0, :, ragged_len - 1] += dg_last_reshaped[0]
+        else:
+            dg_c[:, :, C - 1] += dg_last_reshaped
         # [N, H, C] -> [N, C, H] -> [N*C, H]
         dg[b_idx, s0:s0 + N * C, :] = dg_c.to(gtype).permute(0, 2, 1).reshape(N * C, H)
         timer.stop("batched_dg_intra_accum")
@@ -412,60 +453,365 @@ def chunk_bwd_dqkwg_cpu(
 
         timer.stop("batched_total")
 
+    # ------------------------------------------------------------------
+    # 跨序列批量处理 ragged tails（varlen 模式下多个序列的尾部 chunk）。
+    # 每个 tail 有不同的有效长度 ragged_i，pad 到 C 后批量计算。
+    # padding 位置贡献为零（do=0/v=0），唯一需修正的是 dg_last_accum 位置：
+    # 每个 tail 的 dg_last_accum 加到 ragged_i - 1 而非 C - 1。
+    # ------------------------------------------------------------------
+    def process_tails_batched(b_idx: int, tails: list):
+        nonlocal chunk_count
+        N = len(tails)
+        C = chunk_size
+        H = HV
+        chunk_count += N
+        timer.start("tails_total")
+
+        # ---- 收集并 pad 每个 tail ----
+        timer.start("tails_data_prep")
+        q_list, k_list, v_list, do_list, dv_list, g_list, h_list, dh_list = [], [], [], [], [], [], [], []
+        for ts, tr, h_idx in tails:
+            te = ts + tr
+            pad_len = C - tr
+            q_list.append(torch.nn.functional.pad(q_ct[b_idx, :, ts:te, :], (0, 0, 0, pad_len)))
+            k_list.append(torch.nn.functional.pad(k_ct[b_idx, :, ts:te, :], (0, 0, 0, pad_len)))
+            v_list.append(torch.nn.functional.pad(v_ct[b_idx, :, ts:te, :], (0, 0, 0, pad_len)))
+            do_list.append(torch.nn.functional.pad(do_ct[b_idx, :, ts:te, :], (0, 0, 0, pad_len)))
+            dv_list.append(torch.nn.functional.pad(dv_ct[b_idx, :, ts:te, :], (0, 0, 0, pad_len)))
+            g_t = g_ct[b_idx, :, ts:te]
+            g_list.append(torch.cat([g_t, g_t[:, -1:].expand(-1, pad_len)], dim=1))
+            h_list.append(h[b_idx, h_idx, :, :, :])
+            dh_list.append(dh[b_idx, h_idx, :, :, :])
+
+        # stack: [N, HK/HV, C, D] -> reshape [N*H, C, D]
+        q_b = torch.stack(q_list, dim=0)  # [N, HK, C, K]
+        if n_ratio > 1:
+            q_b = q_b.repeat_interleave(n_ratio, dim=1)
+        q_b = q_b.reshape(N * H, C, K)
+        k_b = torch.stack(k_list, dim=0)
+        if n_ratio > 1:
+            k_b = k_b.repeat_interleave(n_ratio, dim=1)
+        k_b = k_b.reshape(N * H, C, K)
+        v_b = torch.stack(v_list, dim=0).reshape(N * H, C, V)
+        do_b = torch.stack(do_list, dim=0).reshape(N * H, C, V)
+        dv_b = torch.stack(dv_list, dim=0).reshape(N * H, C, V)
+        g_b = torch.stack(g_list, dim=0).reshape(N * H, C)  # gtype
+        h_b = torch.stack(h_list, dim=0).reshape(N * H, K, V)
+        dh_b = torch.stack(dh_list, dim=0).reshape(N * H, K, V)
+        h_b_t = h_b.transpose(-1, -2).to(calc_type)
+        dh_b_t = dh_b.transpose(-1, -2).to(calc_type)
+        timer.stop("tails_data_prep")
+
+        # ---- 1. State contributions ----
+        timer.start("tails_bmm_state")
+        dq_state = cast_round(torch.bmm(do_b, h_b_t))
+        dk_state = cast_round(torch.bmm(v_b, dh_b_t))
+        timer.stop("tails_bmm_state")
+
+        timer.start("tails_bmm_dw")
+        dw_c = cast_round(torch.bmm(dv_b, h_b_t))
+        timer.stop("tails_bmm_dw")
+
+        timer.start("tails_mask")
+        mask_f = get_causal_mask_f(C, q.device)
+        timer.stop("tails_mask")
+
+        # ---- 2. Decay scale ----
+        timer.start("tails_decay_scale")
+        g_last = g_b.reshape(N, H, C)[:, :, C - 1].reshape(N * H)
+        exp_gc = torch.exp(g_b)
+        exp_neg_gc_glast = torch.exp(-g_b + g_last[:, None])
+        dq_state = dq_state * (exp_gc[:, :, None] * scale)
+        dk_state = dk_state * exp_neg_gc_glast[:, :, None]
+        timer.stop("tails_decay_scale")
+
+        # ---- 3. Intra-chunk attention ----
+        timer.start("tails_bmm_intra_ds")
+        ds = cast_round(torch.bmm(do_b, v_b.transpose(1, 2)))
+        timer.stop("tails_bmm_intra_ds")
+        timer.start("tails_decay_apply")
+        g_diff = g_b[:, :, None] - g_b[:, None, :]
+        decay_mat = torch.clamp(g_diff, max=0).exp_()
+        ds = ds * decay_mat
+        ds = ds * mask_f
+        ds = ds * scale
+        timer.stop("tails_decay_apply")
+
+        timer.start("tails_bmm_qk")
+        qk_t = cast_round(torch.bmm(q_b, k_b.transpose(1, 2)))
+        ds2 = ds * qk_t
+        dg_c = ds2.sum(dim=-1)
+        dg_c = dg_c - ds2.sum(dim=-2)
+        timer.stop("tails_bmm_qk")
+
+        # ---- dg_state ----
+        timer.start("tails_dg_state")
+        dg_c = cast_round(dg_c)
+        dg_c += (dq_state * q_b).sum(dim=-1)
+        dg_c = cast_round(dg_c)
+        k_dk_prod = k_b * dk_state
+        dg_c = dg_c - k_dk_prod.sum(dim=-1)
+        dg_last_accum = (h_b * dh_b).sum(dim=(-1, -2)) * torch.exp(g_last)
+        dg_last_accum = dg_last_accum + k_dk_prod.sum(dim=(-1, -2))
+        timer.stop("tails_dg_state")
+
+        # ---- dg_last_accum 位置修正 + 写回 ----
+        timer.start("tails_dg_write_back")
+        dg_c = dg_c.reshape(N, H, C)
+        dg_last_reshaped = dg_last_accum.reshape(N, H)
+        for i, (ts, tr, _) in enumerate(tails):
+            # 加到 ragged_i - 1（原始最后有效 token），而非 C - 1
+            dg_c[i, :, tr - 1] += dg_last_reshaped[i]
+            # 写回到原始位置 [ts, ts + tr)
+            dg[b_idx, ts:ts + tr, :] = dg_c[i, :, :tr].to(gtype).permute(1, 0)
+        timer.stop("tails_dg_write_back")
+
+        # ---- 4. dq/dk intra ----
+        timer.start("tails_bmm_dqdk_intra")
+        dq_intra = cast_round(torch.bmm(ds, k_b))
+        dk_intra = cast_round(torch.bmm(ds.transpose(1, 2), q_b))
+        timer.stop("tails_bmm_dqdk_intra")
+
+        timer.start("tails_accumulate")
+        dq_total = dq_state + dq_intra
+        dk_total = dk_state + dk_intra
+        timer.stop("tails_accumulate")
+
+        # ---- 写回 dq_hv/dk_hv（只写有效长度部分）----
+        timer.start("tails_write_back")
+        dq_total = dq_total.reshape(N, H, C, K)
+        dk_total = dk_total.reshape(N, H, C, K)
+        if datatype == calc_type:
+            for i, (ts, tr, _) in enumerate(tails):
+                dq_hv[b_idx, ts:ts + tr, :, :] = dq_total[i, :, :tr, :].permute(1, 0, 2)
+                dk_hv[b_idx, ts:ts + tr, :, :] = dk_total[i, :, :tr, :].permute(1, 0, 2)
+        else:
+            for i, (ts, tr, _) in enumerate(tails):
+                dq_hv[b_idx, ts:ts + tr, :, :] = dq_total[i, :, :tr, :].to(datatype).permute(1, 0, 2)
+                dk_hv[b_idx, ts:ts + tr, :, :] = dk_total[i, :, :tr, :].to(datatype).permute(1, 0, 2)
+        # 写回 dw（只写有效长度部分）
+        dw_c = dw_c.reshape(N, H, C, K)
+        for i, (ts, tr, _) in enumerate(tails):
+            dw[b_idx, ts:ts + tr, :, :] = (-dw_c[i, :, :tr, :]).permute(1, 0, 2)
+        timer.stop("tails_write_back")
+
+        timer.stop("tails_total")
+
+    # ------------------------------------------------------------------
+    # 合并多个序列的满 chunk 为一次大 batched 调用。
+    # 不同序列的满 chunk token 范围不连续，需要 cat 拼接后统一处理，
+    # 完成后拆分写回到各自的原始位置。
+    # ------------------------------------------------------------------
+    def process_varlen_merged(b_idx: int, full_ranges: list):
+        nonlocal chunk_count
+        C = chunk_size
+        H = HV
+        total_N = sum(nf for _, nf, _ in full_ranges)
+        chunk_count += total_N
+        timer.start("merged_total")
+
+        # ---- 数据准备：cat 拼接所有序列的满 chunk ----
+        timer.start("merged_data_prep")
+        q_cats = [q_ct[b_idx, :, s:s + nf * C, :] for s, nf, _ in full_ranges]
+        k_cats = [k_ct[b_idx, :, s:s + nf * C, :] for s, nf, _ in full_ranges]
+        v_cats = [v_ct[b_idx, :, s:s + nf * C, :] for s, nf, _ in full_ranges]
+        do_cats = [do_ct[b_idx, :, s:s + nf * C, :] for s, nf, _ in full_ranges]
+        dv_cats = [dv_ct[b_idx, :, s:s + nf * C, :] for s, nf, _ in full_ranges]
+        g_cats = [g_ct[b_idx, :, s:s + nf * C] for s, nf, _ in full_ranges]
+        h_cats = [h[b_idx, ho:ho + nf, :, :, :] for _, nf, ho in full_ranges]
+        dh_cats = [dh[b_idx, ho:ho + nf, :, :, :] for _, nf, ho in full_ranges]
+
+        # 拼接后按 chunk 重排
+        # q/k: [HK, total_N*C, K] -> [HK, total_N, C, K] -> [total_N, HK, C, K]
+        q_all = torch.cat(q_cats, dim=1).reshape(HK, total_N, C, K).permute(1, 0, 2, 3)
+        if n_ratio > 1:
+            q_all = q_all.repeat_interleave(n_ratio, dim=1)
+        q_b = q_all.reshape(total_N * H, C, K)
+
+        k_all = torch.cat(k_cats, dim=1).reshape(HK, total_N, C, K).permute(1, 0, 2, 3)
+        if n_ratio > 1:
+            k_all = k_all.repeat_interleave(n_ratio, dim=1)
+        k_b = k_all.reshape(total_N * H, C, K)
+
+        v_b = torch.cat(v_cats, dim=1).reshape(H, total_N, C, V).permute(1, 0, 2, 3).reshape(total_N * H, C, V)
+        do_b = torch.cat(do_cats, dim=1).reshape(H, total_N, C, V).permute(1, 0, 2, 3).reshape(total_N * H, C, V)
+        dv_b = torch.cat(dv_cats, dim=1).reshape(H, total_N, C, V).permute(1, 0, 2, 3).reshape(total_N * H, C, V)
+        g_b = torch.cat(g_cats, dim=1).reshape(H, total_N, C).permute(1, 0, 2).reshape(total_N * H, C)
+
+        h_b = torch.cat(h_cats, dim=0).reshape(total_N * H, K, V)
+        dh_b = torch.cat(dh_cats, dim=0).reshape(total_N * H, K, V)
+        h_b_t = h_b.transpose(-1, -2).to(calc_type)
+        dh_b_t = dh_b.transpose(-1, -2).to(calc_type)
+        timer.stop("merged_data_prep")
+
+        N = total_N
+
+        # ---- 1. State contributions ----
+        timer.start("merged_bmm_state")
+        dq_state = cast_round(torch.bmm(do_b, h_b_t))
+        dk_state = cast_round(torch.bmm(v_b, dh_b_t))
+        timer.stop("merged_bmm_state")
+
+        timer.start("merged_bmm_dw")
+        dw_c = cast_round(torch.bmm(dv_b, h_b_t))
+        timer.stop("merged_bmm_dw")
+
+        timer.start("merged_mask")
+        mask_f = get_causal_mask_f(C, q.device)
+        timer.stop("merged_mask")
+
+        # ---- 2. Decay scale ----
+        timer.start("merged_decay_scale")
+        g_last = g_b.reshape(N, H, C)[:, :, C - 1].reshape(N * H)
+        exp_gc = torch.exp(g_b)
+        exp_neg_gc_glast = torch.exp(-g_b + g_last[:, None])
+        dq_state = dq_state * (exp_gc[:, :, None] * scale)
+        dk_state = dk_state * exp_neg_gc_glast[:, :, None]
+        timer.stop("merged_decay_scale")
+
+        # ---- 3. Intra-chunk attention ----
+        timer.start("merged_bmm_intra_ds")
+        ds = cast_round(torch.bmm(do_b, v_b.transpose(1, 2)))
+        timer.stop("merged_bmm_intra_ds")
+        timer.start("merged_decay_apply")
+        g_diff = g_b[:, :, None] - g_b[:, None, :]
+        decay_mat = torch.clamp(g_diff, max=0).exp_()
+        ds = ds * decay_mat
+        ds = ds * mask_f
+        ds = ds * scale
+        timer.stop("merged_decay_apply")
+
+        timer.start("merged_bmm_qk")
+        qk_t = cast_round(torch.bmm(q_b, k_b.transpose(1, 2)))
+        ds2 = ds * qk_t
+        dg_c = ds2.sum(dim=-1)
+        dg_c = dg_c - ds2.sum(dim=-2)
+        timer.stop("merged_bmm_qk")
+
+        # ---- dg_state ----
+        timer.start("merged_dg_state")
+        dg_c = cast_round(dg_c)
+        dg_c += (dq_state * q_b).sum(dim=-1)
+        dg_c = cast_round(dg_c)
+        k_dk_prod = k_b * dk_state
+        dg_c = dg_c - k_dk_prod.sum(dim=-1)
+        dg_last_accum = (h_b * dh_b).sum(dim=(-1, -2)) * torch.exp(g_last)
+        dg_last_accum = dg_last_accum + k_dk_prod.sum(dim=(-1, -2))
+        timer.stop("merged_dg_state")
+
+        # ---- dg_last_accum + 写回 dg（按序列拆分）----
+        timer.start("merged_dg_write_back")
+        dg_c = dg_c.reshape(N, H, C)
+        dg_last_reshaped = dg_last_accum.reshape(N, H)
+        dg_c[:, :, C - 1] += dg_last_reshaped
+        # 拆分写回到各自的原始位置
+        offset = 0
+        for s, nf, _ in full_ranges:
+            n_tokens = nf * C
+            dg_chunk = dg_c[offset:offset + nf].to(gtype).permute(0, 2, 1).reshape(n_tokens, H)
+            dg[b_idx, s:s + n_tokens, :] = dg_chunk
+            offset += nf
+        timer.stop("merged_dg_write_back")
+
+        # ---- 4. dq/dk intra ----
+        timer.start("merged_bmm_dqdk_intra")
+        dq_intra = cast_round(torch.bmm(ds, k_b))
+        dk_intra = cast_round(torch.bmm(ds.transpose(1, 2), q_b))
+        timer.stop("merged_bmm_dqdk_intra")
+
+        timer.start("merged_accumulate")
+        dq_total = dq_state + dq_intra
+        dk_total = dk_state + dk_intra
+        timer.stop("merged_accumulate")
+
+        # ---- 写回 dq_hv/dk_hv/dw（按序列拆分）----
+        timer.start("merged_write_back")
+        dq_total = dq_total.reshape(N, H, C, K)
+        dk_total = dk_total.reshape(N, H, C, K)
+        dw_c = dw_c.reshape(N, H, C, K)
+        offset = 0
+        for s, nf, _ in full_ranges:
+            n_tokens = nf * C
+            if datatype == calc_type:
+                dq_hv[b_idx, s:s + n_tokens, :, :] = dq_total[offset:offset + nf].permute(0, 2, 1, 3).reshape(n_tokens, H, K)
+                dk_hv[b_idx, s:s + n_tokens, :, :] = dk_total[offset:offset + nf].permute(0, 2, 1, 3).reshape(n_tokens, H, K)
+            else:
+                dq_hv[b_idx, s:s + n_tokens, :, :] = dq_total[offset:offset + nf].to(datatype).permute(0, 2, 1, 3).reshape(n_tokens, H, K)
+                dk_hv[b_idx, s:s + n_tokens, :, :] = dk_total[offset:offset + nf].to(datatype).permute(0, 2, 1, 3).reshape(n_tokens, H, K)
+            dw[b_idx, s:s + n_tokens, :, :] = (-dw_c[offset:offset + nf]).permute(0, 2, 1, 3).reshape(n_tokens, H, K)
+            offset += nf
+        timer.stop("merged_write_back")
+
+        timer.stop("merged_total")
+
     # Main Loop
     mode = "varlen" if cu_seqlens is not None else "dense"
     if verbose_timing:
-        print(f"[chunk_bwd_dqkwg_cpu] start: B={B} T={T} HK={HK} HV={HV} K={K} V={V} "
+        print(f"[chunk_bwd_dqkwg_cpu] start: B={B} T={T} T_orig={T_orig} ragged_len={ragged_len} "
+              f"HK={HK} HV={HV} K={K} V={V} "
               f"n_ratio={n_ratio} chunk_size={chunk_size} mode={mode} benchmark={benchmark}")
     timer.start("main_loop")
     if cu_seqlens is None:
-        # Fixed length padding assumed or B*T
-        C = chunk_size
+        # T 已 padding 到 chunk_size 的整数倍，所有 chunk 统一走 batched 路径
         for b in range(B):
             n_full = T // C
             if n_full > 0:
-                process_dense_batched(b, n_full, 0, 0)
-            # ragged 尾部：走逐 chunk 路径
-            rem_start = n_full * C
-            if rem_start < T:
-                process_sequence(b, rem_start, T, b, n_full)
+                process_dense_batched(b, n_full, 0, 0, ragged_len=ragged_len)
     else:
-        # Variable length
-        chunk_location = torch.zeros(cu_seqlens.shape[0], dtype=torch.int64) #每个seq的chunk起始位置
-        #chunk_location tensor([0, 64, 96, 128]) 代表：[0,63] [64,95] [96,127]
-
+        # Variable length B=1
+        # 计算每个序列的 chunk 起始位置
+        chunk_location_list = [0]
+        seq_infos = []
         for i in range(len(cu_seqlens) - 1):
-            start, end = cu_seqlens[i].item(), cu_seqlens[i+1].item()
-            seq_length = end - start
-            if i == 0:
-                chunk_start_token_idx = 0
-            else:
-                chunk_start_token_idx = chunk_location[i]
-            chunk_end_token_idx = chunk_start_token_idx + (seq_length + chunk_size - 1) // chunk_size
-            chunk_location[i + 1] = chunk_end_token_idx
+            start = cu_seqlens[i].item()
+            end = cu_seqlens[i+1].item()
+            seq_len = end - start
+            n_chunks = (seq_len + C - 1) // C
+            seq_infos.append((start, seq_len, chunk_location_list[-1]))
+            chunk_location_list.append(chunk_location_list[-1] + n_chunks)
 
-            # 在 Varlen 模式下，q/k/v 通常已经是 (Total_T, ...) 或者是 (1, Total_T, ...)
-            # 但这里输入还是 (B, T, ...)，我们需要确认输入格式。
-            # 通常 Triton varlen kernel 的输入 q 是 (Total_T, H, K)。
-            # 如果输入是 packed (1, Total_T, ...)，b_idx 永远是 0。
-            # 如果输入是 padded (B, T, ...)，则需要根据 cu_seqlens 切分。
-            # 假设输入已根据 varlen 展平 (Batch=1) 或保持 Padded 格式。
-            # 鉴于 Triton 代码 `i_b = i_bh // H`，如果 IS_VARLEN，逻辑略有不同。
-            # 为保证通用性，这里假设输入是 Padded (B, T) 且 cu_seqlens 描述有效区域，
-            # 或者 B=1 的 Packed 模式。
-            if B == 1:
-                process_sequence(0, start, end, i, chunk_location[i])
-            else:
-                # 如果是 Padded Batch 且提供了 cu_seqlens，这通常不常见，
-                # 但如果发生，通常 cu_seqlens[i] 是第 i 个样本的长度。
-                # 简化起见，我们假设 input 是 packed flat tensor 如果 cu_seqlens 存在。
-                pass
+        # Phase 1: 合并所有序列的满 chunk 为一次 batched 调用
+        # 收集每个序列的满 chunk token 范围和 h/dh 偏移
+        full_ranges = []
+        for start, seq_len, h_off in seq_infos:
+            n_full = seq_len // C
+            if n_full > 0:
+                full_ranges.append((start, n_full, h_off))
+
+        if len(full_ranges) == 1:
+            # 只有一个序列有满 chunk，直接调用
+            ts, nf, th = full_ranges[0]
+            process_dense_batched(0, nf, ts, th, ragged_len=0)
+        elif len(full_ranges) > 1:
+            # 合并多个序列的满 chunk 为一次大 batched 调用
+            process_varlen_merged(0, full_ranges)
+
+        # Phase 2: 跨序列批量处理 ragged tails
+        tails = []
+        for start, seq_len, h_off in seq_infos:
+            n_full = seq_len // C
+            ragged = seq_len % C
+            if ragged > 0:
+                tails.append((start + n_full * C, ragged, h_off + n_full))
+
+        if len(tails) == 1:
+            ts, tr, th = tails[0]
+            process_sequence(0, ts, ts + tr, 0, th)
+        elif len(tails) > 1:
+            process_tails_batched(0, tails)
     timer.stop("main_loop")
 
     timer.start("reduce")
     dq = dq_hv.view(B, T, HK, n_ratio, K).sum(dim=3).to(datatype)
     dk = dk_hv.view(B, T, HK, n_ratio, K).sum(dim=3).to(datatype)
     timer.stop("reduce")
+
+    # 截断到原始 T（去除 padding 部分）
+    if pad_T > 0:
+        dq = dq[:, :T_orig]
+        dk = dk[:, :T_orig]
+        dw = dw[:, :T_orig]
+        dg = dg[:, :T_orig]
 
     t_total = time.perf_counter() - t_total_start
     summary = timer.summary(t_total, chunk_count)

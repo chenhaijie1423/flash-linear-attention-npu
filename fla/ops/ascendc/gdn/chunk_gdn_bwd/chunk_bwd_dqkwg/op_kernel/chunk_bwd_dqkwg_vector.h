@@ -229,7 +229,7 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::Init(const C
     pipe->InitBuffer(inQue1, BUFFER_NUM, BT * K * sizeof(float));     // 64K
     pipe->InitBuffer(inQue2, BUFFER_NUM, BT * K * sizeof(float));     // 64K
     pipe->InitBuffer(inQue3, 2, BT * sizeof(float));                  // 1K
-    pipe->InitBuffer(inQue4, 2, BT * sizeof(GType));                  // 1K
+    pipe->InitBuffer(inQue4, 2, BT * sizeof(float));                  // 1K
     pipe->InitBuffer(outQue1, BUFFER_NUM, BT * K * sizeof(DataType)); // 32K
     pipe->InitBuffer(outQue2, BUFFER_NUM, BT * sizeof(float));        // 512B
 
@@ -405,6 +405,10 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessAVect
     uint32_t chunkIdx = loopIdx % numChunks;
     uint32_t actual_dwSize = real_BT * K;
     WaitCubeReady();
+
+    // 同步AIV子核，等待dg_last空间释放
+    AscendC::CrossCoreSetFlag<0x1, PIPE_MTE3>(0x8);
+    AscendC::CrossCoreWaitFlag(0x8);
 
     // ---------- Part1: dg_last = sum(h*dh), dw = -dw (head-split) ----------
     for (uint32_t h = 0; h < HV; h++) {
@@ -641,9 +645,6 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessCVect
 
         // CopyIn: dq_inner, q, g, dg
         {
-            TEventID eventId = GetTPipePtr()->FetchEventID(HardEvent::V_MTE2);
-            SetFlag<HardEvent::V_MTE2>(eventId);
-            WaitFlag<HardEvent::V_MTE2>(eventId);
             auto tensorDqIn = inQue1.AllocTensor<DataType>();
             auto tensorQIn = inQue2.AllocTensor<DataType>();
             auto tensorGIn = inQue3.AllocTensor<GType>();
@@ -764,9 +765,6 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessCVect
 
         // CopyIn: g, dg
         {
-            TEventID eventId = GetTPipePtr()->FetchEventID(HardEvent::V_MTE2);
-            SetFlag<HardEvent::V_MTE2>(eventId);
-            WaitFlag<HardEvent::V_MTE2>(eventId);
             auto tensorGIn = inQue3.AllocTensor<GType>();
             auto tensorDgIn = inQue4.AllocTensor<GType>();
             if constexpr (std::is_same<GType, float>::value) {
