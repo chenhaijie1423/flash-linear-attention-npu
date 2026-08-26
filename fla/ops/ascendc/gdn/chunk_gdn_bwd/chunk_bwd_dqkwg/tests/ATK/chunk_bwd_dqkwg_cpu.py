@@ -289,6 +289,7 @@ def chunk_bwd_dqkwg_cpu(
             # 4. Final Accumulation for dq, dk
             # -----------------------------------------------------------
             timer.start("bmm_dqdk_intra")
+            ds = cast_round(ds)
             dq_intra = cast_round(torch.bmm(ds, k_h))               # [HV, L, K]
             dk_intra = cast_round(torch.bmm(ds.transpose(1, 2), q_h))# [HV, L, K]
             timer.stop("bmm_dqdk_intra")
@@ -431,6 +432,7 @@ def chunk_bwd_dqkwg_cpu(
 
         # ---- 4. dq/dk intra ----
         timer.start("batched_bmm_dqdk_intra")
+        ds = cast_round(ds)
         dq_intra = cast_round(torch.bmm(ds, k_b))                                          # [N*H, C, K]
         dk_intra = cast_round(torch.bmm(ds.transpose(1, 2), q_b))                          # [N*H, C, K]
         timer.stop("batched_bmm_dqdk_intra")
@@ -568,6 +570,7 @@ def chunk_bwd_dqkwg_cpu(
 
         # ---- 4. dq/dk intra ----
         timer.start("tails_bmm_dqdk_intra")
+        ds = cast_round(ds)
         dq_intra = cast_round(torch.bmm(ds, k_b))
         dk_intra = cast_round(torch.bmm(ds.transpose(1, 2), q_b))
         timer.stop("tails_bmm_dqdk_intra")
@@ -715,6 +718,7 @@ def chunk_bwd_dqkwg_cpu(
 
         # ---- 4. dq/dk intra ----
         timer.start("merged_bmm_dqdk_intra")
+        ds = cast_round(ds)
         dq_intra = cast_round(torch.bmm(ds, k_b))
         dk_intra = cast_round(torch.bmm(ds.transpose(1, 2), q_b))
         timer.stop("merged_bmm_dqdk_intra")

@@ -923,6 +923,11 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessDVect
     uint32_t actual_dkSize = real_BT * K;
     WaitCubeReady();
 
+    // wait dg out
+    TEventID eventIdMte3ToMte2 = GetTPipePtr()->FetchEventID(HardEvent::MTE3_MTE2);
+    SetFlag<HardEvent::MTE3_MTE2>(eventIdMte3ToMte2);
+    WaitFlag<HardEvent::MTE3_MTE2>(eventIdMte3ToMte2);
+
     for (uint32_t h = 0; h < HV; h++) {
         if ((h & 1) != subBlockIdx) {
             continue;
@@ -1113,6 +1118,11 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessDVect
     uint32_t bIdx = loopIdx / numChunks;
     uint64_t bos_hk = bos - static_cast<uint64_t>(bIdx) * static_cast<uint64_t>(HV - HK) * T;
     WaitCubeReady();
+
+    // wait dg out
+    TEventID eventIdMte3ToMte2 = GetTPipePtr()->FetchEventID(HardEvent::MTE3_MTE2);
+    SetFlag<HardEvent::MTE3_MTE2>(eventIdMte3ToMte2);
+    WaitFlag<HardEvent::MTE3_MTE2>(eventIdMte3ToMte2);
 
     LocalTensor<float> tensorDkSum;
     for (uint32_t h = 0; h < HV; h++) {
