@@ -133,10 +133,10 @@ def chunk_bwd_dqkwg_cpu(
 
     # Keep per-value-head contributions first, then reduce them into key heads.
     timer.start("alloc")
-    dq_hv = torch.zeros((B, T, HV, K), dtype=datatype)
-    dk_hv = torch.zeros((B, T, HV, K), dtype=datatype)
+    dq_hv = torch.empty((B, T, HV, K), dtype=datatype)
+    dk_hv = torch.empty((B, T, HV, K), dtype=datatype)
     dg = torch.zeros_like(g)
-    dw = torch.zeros((B, T, HV, K), dtype=datatype)
+    dw = torch.empty((B, T, HV, K), dtype=datatype)
     timer.stop("alloc")
 
     # 缓存因果 mask（按 actual_chunk_len），避免每个 chunk 重复构造
@@ -171,6 +171,19 @@ def chunk_bwd_dqkwg_cpu(
         if n_ratio == 1:
             return t
         return t.repeat_interleave(n_ratio, dim=0)
+
+    def stacked_bmm(lhs_list, rhs_list):
+        """将多个 (lhs, rhs) 对 stack 成一次 bmm，结果按原 batch 大小拆分。
+           当列表长度为 1 时退化为普通 bmm，不引入额外 cat/split 开销。"""
+        if len(lhs_list) == 0:
+            return []
+        if len(lhs_list) == 1:
+            return [cast_round(torch.bmm(lhs_list[0], rhs_list[0]))]
+        L = torch.cat(lhs_list, dim=0)
+        R = torch.cat(rhs_list, dim=0)
+        result = cast_round(torch.bmm(L, R))
+        sizes = [t.shape[0] for t in lhs_list]
+        return list(result.split(sizes, dim=0))
 
     def process_sequence(b_idx, t_start, t_end, seq_idx_in_batch, chunk_start_idx):
         nonlocal chunk_count
@@ -244,10 +257,8 @@ def chunk_bwd_dqkwg_cpu(
             timer.stop("bmm_intra_ds")
             timer.start("decay_apply")
             decay_mat = torch.exp(torch.min(g_h[:, :, None] - g_h[:, None, :], torch.tensor(0)))  # [HV, L, L]
-            # 融合：避免 where(scalar) 类型提升与多次临时分配
-            ds = ds * decay_mat
-            ds = ds * mask_f                  # [1, L, L] 广播掩码
-            ds = ds * scale
+            # 融合：避免多次临时分配，原地链式乘法
+            ds.mul_(decay_mat).mul_(mask_f).mul_(scale)
             timer.stop("decay_apply")
 
             timer.start("bmm_qk")
@@ -350,19 +361,25 @@ def chunk_bwd_dqkwg_cpu(
         dh_b_t = dh_b.transpose(-1, -2).to(calc_type)            # [N*H, V, K]
         timer.stop("batched_data_prep")
 
-        # ---- 1. State contributions ----
-        timer.start("batched_bmm_state")
-        dq_state = cast_round(torch.bmm(do_b, h_b_t))             # [N*H, C, K]
-        dk_state = cast_round(torch.bmm(v_b, dh_b_t))            # [N*H, C, K]
-        timer.stop("batched_bmm_state")
-
-        timer.start("batched_bmm_dw")
+        # ---- Phase 1: 合并所有无依赖的 bmm（按 V/K 形状自动分组）----
+        timer.start("batched_bmm_phase1")
+        # V 组 A：右侧最后维为 K (h_b_t, dh_b_t 均为 [N*H, V, K])
+        # lhs: do_b, v_b, dv_b 均为 [N*H, C, V]
         dv_b = dv_ct[b_idx, :, s0:s0 + N * C, :].reshape(H, N, C, V).permute(1, 0, 2, 3).reshape(N * H, C, V)
-        dw_c = cast_round(torch.bmm(dv_b, h_b_t))            # [N*H, C, K]
+        v_lhs_A = [do_b, v_b, dv_b]
+        v_rhs_A = [h_b_t, dh_b_t, h_b_t]
+        dq_state, dk_state, dw_c = stacked_bmm(v_lhs_A, v_rhs_A)
+        # V 组 B：右侧最后维为 C (v_b^T 为 [N*H, V, C])，单独处理
+        ds = stacked_bmm([do_b], [v_b.transpose(1, 2).contiguous()])[0]
+        # K 组：lhs 最后一维为 K (q_b [N*H, C, K])
+        qk_t = stacked_bmm([q_b], [k_b.transpose(1, 2).contiguous()])[0]
+        timer.stop("batched_bmm_phase1")
+
+        timer.start("batched_write_dw")
         # [N*H, C, K] -> [N, H, C, K] -> [N, C, H, K] -> [N*C, H, K]
         dw_neg = (-dw_c).reshape(N, H, C, K).permute(0, 2, 1, 3).reshape(N * C, H, K)
         dw[b_idx, s0:s0 + N * C, :, :] = dw_neg
-        timer.stop("batched_bmm_dw")
+        timer.stop("batched_write_dw")
 
         timer.start("batched_mask")
         mask_f = get_causal_mask_f(C, q.device)                  # [1, C, C]
@@ -381,21 +398,15 @@ def chunk_bwd_dqkwg_cpu(
         timer.stop("batched_decay_scale")
 
         # ---- 3. Intra-chunk attention ----
-        timer.start("batched_bmm_intra_ds")
-        ds = cast_round(torch.bmm(do_b, v_b.transpose(1, 2)))                              # [N*H, C, C]
-        timer.stop("batched_bmm_intra_ds")
         timer.start("batched_decay_apply")
         # 用 clamp 替代 min(tensor, scalar)，避免每 chunk 创建标量张量
         # in-place exp_ 节省一次 [N*H, C, C] 分配
         g_diff = g_b[:, :, None] - g_b[:, None, :]
         decay_mat = torch.clamp(g_diff, max=0).exp_()                                      # [N*H, C, C]
-        ds = ds * decay_mat
-        ds = ds * mask_f
-        ds = ds * scale
+        ds.mul_(decay_mat).mul_(mask_f).mul_(scale)
         timer.stop("batched_decay_apply")
 
         timer.start("batched_bmm_qk")
-        qk_t = cast_round(torch.bmm(q_b, k_b.transpose(1, 2)))                             # [N*H, C, C]
         ds2 = ds * qk_t
         dg_c = ds2.sum(dim=-1)
         dg_c = dg_c - ds2.sum(dim=-2)
@@ -504,15 +515,17 @@ def chunk_bwd_dqkwg_cpu(
         dh_b_t = dh_b.transpose(-1, -2).to(calc_type)
         timer.stop("tails_data_prep")
 
-        # ---- 1. State contributions ----
-        timer.start("tails_bmm_state")
-        dq_state = cast_round(torch.bmm(do_b, h_b_t))
-        dk_state = cast_round(torch.bmm(v_b, dh_b_t))
-        timer.stop("tails_bmm_state")
-
-        timer.start("tails_bmm_dw")
-        dw_c = cast_round(torch.bmm(dv_b, h_b_t))
-        timer.stop("tails_bmm_dw")
+        # ---- Phase 1: 合并所有无依赖的 bmm（按 V/K 形状自动分组）----
+        timer.start("tails_bmm_phase1")
+        # V 组 A：右侧最后维为 K (h_b_t, dh_b_t 均为 [N*H, V, K])
+        v_lhs_A = [do_b, v_b, dv_b]
+        v_rhs_A = [h_b_t, dh_b_t, h_b_t]
+        dq_state, dk_state, dw_c = stacked_bmm(v_lhs_A, v_rhs_A)
+        # V 组 B：右侧最后维为 C (v_b^T 为 [N*H, V, C])，单独处理
+        ds = stacked_bmm([do_b], [v_b.transpose(1, 2).contiguous()])[0]
+        # K 组：lhs 最后一维为 K
+        qk_t = stacked_bmm([q_b], [k_b.transpose(1, 2).contiguous()])[0]
+        timer.stop("tails_bmm_phase1")
 
         timer.start("tails_mask")
         mask_f = get_causal_mask_f(C, q.device)
@@ -528,19 +541,13 @@ def chunk_bwd_dqkwg_cpu(
         timer.stop("tails_decay_scale")
 
         # ---- 3. Intra-chunk attention ----
-        timer.start("tails_bmm_intra_ds")
-        ds = cast_round(torch.bmm(do_b, v_b.transpose(1, 2)))
-        timer.stop("tails_bmm_intra_ds")
         timer.start("tails_decay_apply")
         g_diff = g_b[:, :, None] - g_b[:, None, :]
         decay_mat = torch.clamp(g_diff, max=0).exp_()
-        ds = ds * decay_mat
-        ds = ds * mask_f
-        ds = ds * scale
+        ds.mul_(decay_mat).mul_(mask_f).mul_(scale)
         timer.stop("tails_decay_apply")
 
         timer.start("tails_bmm_qk")
-        qk_t = cast_round(torch.bmm(q_b, k_b.transpose(1, 2)))
         ds2 = ds * qk_t
         dg_c = ds2.sum(dim=-1)
         dg_c = dg_c - ds2.sum(dim=-2)
@@ -649,15 +656,17 @@ def chunk_bwd_dqkwg_cpu(
 
         N = total_N
 
-        # ---- 1. State contributions ----
-        timer.start("merged_bmm_state")
-        dq_state = cast_round(torch.bmm(do_b, h_b_t))
-        dk_state = cast_round(torch.bmm(v_b, dh_b_t))
-        timer.stop("merged_bmm_state")
-
-        timer.start("merged_bmm_dw")
-        dw_c = cast_round(torch.bmm(dv_b, h_b_t))
-        timer.stop("merged_bmm_dw")
+        # ---- Phase 1: 合并所有无依赖的 bmm（按 V/K 形状自动分组）----
+        timer.start("merged_bmm_phase1")
+        # V 组 A：右侧最后维为 K (h_b_t, dh_b_t 均为 [N*H, V, K])
+        v_lhs_A = [do_b, v_b, dv_b]
+        v_rhs_A = [h_b_t, dh_b_t, h_b_t]
+        dq_state, dk_state, dw_c = stacked_bmm(v_lhs_A, v_rhs_A)
+        # V 组 B：右侧最后维为 C (v_b^T 为 [N*H, V, C])，单独处理
+        ds = stacked_bmm([do_b], [v_b.transpose(1, 2).contiguous()])[0]
+        # K 组：lhs 最后一维为 K
+        qk_t = stacked_bmm([q_b], [k_b.transpose(1, 2).contiguous()])[0]
+        timer.stop("merged_bmm_phase1")
 
         timer.start("merged_mask")
         mask_f = get_causal_mask_f(C, q.device)
@@ -673,19 +682,13 @@ def chunk_bwd_dqkwg_cpu(
         timer.stop("merged_decay_scale")
 
         # ---- 3. Intra-chunk attention ----
-        timer.start("merged_bmm_intra_ds")
-        ds = cast_round(torch.bmm(do_b, v_b.transpose(1, 2)))
-        timer.stop("merged_bmm_intra_ds")
         timer.start("merged_decay_apply")
         g_diff = g_b[:, :, None] - g_b[:, None, :]
         decay_mat = torch.clamp(g_diff, max=0).exp_()
-        ds = ds * decay_mat
-        ds = ds * mask_f
-        ds = ds * scale
+        ds.mul_(decay_mat).mul_(mask_f).mul_(scale)
         timer.stop("merged_decay_apply")
 
         timer.start("merged_bmm_qk")
-        qk_t = cast_round(torch.bmm(q_b, k_b.transpose(1, 2)))
         ds2 = ds * qk_t
         dg_c = ds2.sum(dim=-1)
         dg_c = dg_c - ds2.sum(dim=-2)
@@ -754,6 +757,10 @@ def chunk_bwd_dqkwg_cpu(
         print(f"[chunk_bwd_dqkwg_cpu] start: B={B} T={T} T_orig={T_orig} ragged_len={ragged_len} "
               f"HK={HK} HV={HV} K={K} V={V} "
               f"n_ratio={n_ratio} chunk_size={chunk_size} mode={mode} benchmark={benchmark}")
+    # 小矩阵 bmm 场景：多线程 BLAS 的 spawn/join 开销远超实际计算。
+    # 降为 1 线程消除开销，单线程 BLAS 对小矩阵 cache 更友好。
+    _saved_num_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
     timer.start("main_loop")
     if cu_seqlens is None:
         # T 已 padding 到 chunk_size 的整数倍，所有 chunk 统一走 batched 路径
@@ -822,4 +829,5 @@ def chunk_bwd_dqkwg_cpu(
     if summary:
         print(summary)
 
+    torch.set_num_threads(_saved_num_threads)
     return dq, dk, dw, dg

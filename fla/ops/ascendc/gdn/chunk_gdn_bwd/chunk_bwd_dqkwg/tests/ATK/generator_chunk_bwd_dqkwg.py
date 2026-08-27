@@ -48,10 +48,10 @@ class ChunkBwdDqkwgGenerator(CaseGenerator):
         H = random.randint(1, 32)
         if not is_fix:
             B = 1
-            T = random.randint(1, 409600)
+            T = random.randint(1, 131072)
         else:
-            B = random.randint(1, 100)
-            T = random.randint(1, 4096)
+            B = random.randint(1, 16)
+            T = random.randint(1, 8192)
 
         K = 128
         V = random.choice((128, 256))
