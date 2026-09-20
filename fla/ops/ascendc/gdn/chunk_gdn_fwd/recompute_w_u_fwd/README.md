@@ -125,6 +125,8 @@ aclnnStatus aclnnRecomputeWUFwd(
 - `beta`、`g`、`A` 的 head 维须与 `v` 对齐（`HV`）
 - **GVA 约束**：`HV % HK == 0`；读 `k` 时使用 `hk = hv / (HV / HK)`，写 `w`/`u` 及 `v`/`beta`/`g`/`A` 使用 value head 索引 `hv`
 - `w` 输出形状为 `[B, HV, T, K]`（**非** `empty_like(k)` 的 `[B, HK, T, K]`）
+- `k`、`v`、`a`、`wOut`、`uOut`必须使用相同 dtype（`FLOAT16` 或 `BFLOAT16` 之一）。
+- `g`/`beta` 的 dtype 可为 `FLOAT` 或与 `k` 相同，即 `k=BFLOAT16` 时 `g`/`beta` ∈ {FLOAT, BF16}，`k=FLOAT16` 时 `g`/`beta` ∈ {FLOAT, FLOAT16}。
 
 额外限制：
 
