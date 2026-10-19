@@ -91,9 +91,6 @@ private:
     TQue<AscendC::TPosition::VECIN, 1> gInQue;
     TQue<AscendC::TPosition::VECOUT, 1> dataOutQue;
 
-    __aicore__ inline void NotifyVbReady();
-    __aicore__ inline void NotifyKbgExpReady();
-    __aicore__ inline void WaitRingSlotFree();
     __simd_callee__ inline void CastFloat2KTypeRint(
         RegTensor<kType>& dstReg, RegTensor<float>& srcZeroReg,
         RegTensor<float>& srcOneReg, MaskReg& mask);
@@ -146,25 +143,6 @@ __aicore__ void inline RecomputeWUFwdVectorProcessRegbase<kType, betaType, VDim>
 {
     ProcessVbAndKbgExpInterleaved();
     return;
-}
-
-template <typename kType, typename betaType, int VDim>
-__aicore__ inline void RecomputeWUFwdVectorProcessRegbase<kType, betaType, VDim>::NotifyVbReady()
-{
-    Arch::CrossCoreSetFlagWithReverse<0x2, PIPE_MTE3>(flagAivVbReady);
-}
-
-template <typename kType, typename betaType, int VDim>
-__aicore__ inline void RecomputeWUFwdVectorProcessRegbase<kType, betaType, VDim>::NotifyKbgExpReady()
-{
-    Arch::CrossCoreSetFlagWithReverse<0x2, PIPE_MTE3>(flagAivKbgExpReady);
-}
-
-template <typename kType, typename betaType, int VDim>
-__aicore__ inline void RecomputeWUFwdVectorProcessRegbase<kType, betaType, VDim>::WaitRingSlotFree()
-{
-    // Block the next MTE3 store until AIC has retired the slot's MTE2 read.
-    Arch::CrossCoreWaitFlagWithReverse<0x2, PIPE_MTE3>(flagAivRingSlotFree);
 }
 
 template <typename kType, typename betaType, int VDim>
@@ -281,6 +259,7 @@ template <typename kType, typename betaType, int VDim>
 __aicore__ void inline RecomputeWUFwdVectorProcessRegbase<kType, betaType, VDim>::ProcessVbAndKbgExpInterleaved()
 {
     uint32_t coreLoops = chunkNum;
+    uint32_t subBlockIdx = GetSubBlockIdx();
     uint32_t coreIdx = GetBlockIdx() / GetSubBlockNum();
     uint32_t coreNumAic = GetBlockNum();
     uint32_t rowNum = interleavedVecRow;
@@ -301,24 +280,26 @@ __aicore__ void inline RecomputeWUFwdVectorProcessRegbase<kType, betaType, VDim>
         GetChunkOffset(cu_seqlens, chunk_indices, B, Hv, T, chunkSize, loopIdx, bos, eos);
         uint32_t curChunkSize = eos - bos;
         for (int h = 0; h < Hv; h++) {
+            bool isLast = (loopIdx + coreNumAic >= coreLoops) && (h == Hv - 1);
+            const uint64_t ringTask = static_cast<uint64_t>(coreIdx) *
+                GM_RING_DEPTH + vecTaskIdx % GM_RING_DEPTH;
             ++vecTaskIdx;
-            // The first ring window is initially empty.  Thereafter every
+            // The first ring window is initially empty. Thereafter every
             // task reuses the slot released by the task GM_RING_DEPTH steps
-            // earlier.  All AIV subblocks consume the release token so the
+            // earlier. All AIV subblocks consume the release token so the
             // reverse-depth accounting remains aligned with AIC.
-            if (vecTaskIdx > GM_RING_DEPTH) {
-                WaitRingSlotFree();
-            }
-            if (vecTaskIdx % GetSubBlockNum() != GetSubBlockIdx()) {
+            if ((vecTaskIdx & 0b01) != subBlockIdx) {
                 // Both AIV subcores must contribute one credit per stage.
-                NotifyVbReady();
-                NotifyKbgExpReady();
+                if ((vecTaskIdx & 0b11) == 0 || isLast) {
+                    CrossCoreSetFlag<0x2, PIPE_MTE3>(SYNC_AIC_AIV_FLAG_6);
+                    if (vecTaskIdx > 4) {
+                        CrossCoreWaitFlag<0x2>(SYNC_AIC_AIV_RING_SLOT_FREE_FLAG);
+                    }
+                }
                 continue;
             }
 
             // === 第一部分：Vb = v * beta ===
-            const uint64_t ringTask = static_cast<uint64_t>(coreIdx) *
-                GM_RING_DEPTH + (vecTaskIdx - 1) % GM_RING_DEPTH;
             const uint64_t vbDstBase = ringTask * chunkSize * V;
             for (uint32_t rowOffset = 0; rowOffset < curChunkSize; rowOffset += rowNum) {
                 curRowNum = (rowOffset + rowNum) > curChunkSize ? curChunkSize - rowOffset : rowNum;
@@ -353,9 +334,6 @@ __aicore__ void inline RecomputeWUFwdVectorProcessRegbase<kType, betaType, VDim>
                     dataOutQue.FreeTensor(tensorVbOut);
                 }
             }
-            // Vb 完成通知 AIC 可以做 U matmul
-            NotifyVbReady();
-
             // === 第二部分：KbgExp = k * beta * exp(g) ===
             uint64_t hk = h / hvPerHk;
             for (uint32_t rowOffset = 0; rowOffset < curChunkSize; rowOffset += rowNum) {
@@ -406,16 +384,13 @@ __aicore__ void inline RecomputeWUFwdVectorProcessRegbase<kType, betaType, VDim>
                 }
             }
             // KbgExp 完成通知 AIC 可以做 W matmul
-            NotifyKbgExpReady();
+            if ((vecTaskIdx & 0b11) == 0 || isLast) {
+                CrossCoreSetFlag<0x2, PIPE_MTE3>(SYNC_AIC_AIV_FLAG_6);
+                if (vecTaskIdx > 4) {
+                    CrossCoreWaitFlag<0x2>(SYNC_AIC_AIV_RING_SLOT_FREE_FLAG);
+                }
+            }
         }
-    }
-
-    // AIC publishes one release for every task, while the first ring window
-    // does not consume a release token. Drain the outstanding tail so the
-    // AIC/AIV Set/Wait and reverse-credit counts stay balanced on Ascend 950.
-    uint32_t pendingRingSlots = vecTaskIdx < GM_RING_DEPTH ? vecTaskIdx : GM_RING_DEPTH;
-    for (uint32_t i = 0; i < pendingRingSlots; ++i) {
-        WaitRingSlotFree();
     }
 }
 

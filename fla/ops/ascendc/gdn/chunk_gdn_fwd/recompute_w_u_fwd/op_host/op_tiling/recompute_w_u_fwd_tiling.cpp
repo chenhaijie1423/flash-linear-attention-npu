@@ -36,6 +36,7 @@ static void RecomputeWUFwdTilingDataPrint(gert::TilingContext *context, const Re
     OP_LOGD(nodeName, "=== vbVecRow: %ld", tiling.vbVecRow);
     OP_LOGD(nodeName, "=== kbgExpVecRow: %ld", tiling.kbgExpVecRow);
     OP_LOGD(nodeName, "=== interleavedVecRow: %ld", tiling.interleavedVecRow);
+    OP_LOGD(nodeName, "=== interleavedMembaseVecRow: %ld", tiling.interleavedMembaseVecRow);
     OP_LOGD(nodeName, ">>>>>>>>>>>>>>> Print RecomputeWUFwd tiling data end <<<<<<<<<<<<<<<<");
 }
 
@@ -57,8 +58,6 @@ ge::graphStatus Tiling4RecomputeWUFwd(gert::TilingContext *context)
     uint64_t ubSize = 0;
     ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
     size_t sysWorkspaceSize = ascendcPlatform.GetLibApiWorkSpaceSize();
-    bool enableA5CompactWorkspace =
-        ascendcPlatform.GetCurNpuArch() == NpuArch::DAV_3510;
 
     auto cuSeqlensTensor = context->GetOptionalInputTensor(RECOMPUTE_W_U_FWD_INPUT_SEQLENS_IDX);
     auto chunkIndicesTensor = context->GetOptionalInputTensor(RECOMPUTE_W_U_FWD_INPUT_CHUNK_INDICES_IDX);
@@ -83,7 +82,6 @@ ge::graphStatus Tiling4RecomputeWUFwd(gert::TilingContext *context)
         ubSize,
         sysWorkspaceSize,
         ascendcPlatform.GetCoreNumAic(),
-        enableA5CompactWorkspace,
     };
 
     RecomputeWUFwdTilingProcessor processor(ctx, *tiling);

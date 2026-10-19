@@ -40,6 +40,7 @@ struct RecomputeWUFwdTilingData {
     int64_t vbVecRow;
     int64_t kbgExpVecRow;
     int64_t interleavedVecRow;
+    int64_t interleavedMembaseVecRow;
     int64_t isVariable;
 };
 

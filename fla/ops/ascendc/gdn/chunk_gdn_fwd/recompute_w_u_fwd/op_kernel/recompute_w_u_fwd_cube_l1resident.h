@@ -9,16 +9,17 @@
 
 /*!
  * \file recompute_w_u_fwd_cube_l1resident.h
- * \brief A5 L1 Resident 版本：在同一 chunk+head 内连续做 U 和 W 两个 matmul，
+ * \brief L1 Resident 版本（A5/910B 通用）：在同一 chunk+head 内连续做 U 和 W 两个 matmul，
  *        A 矩阵在 L1 中复用，避免重复 GM→L1 搬运。
  *        使用 ENABLE_L1_RESIDENT=true，BlockMmadTla 自动跳过地址相同的 A/B 加载。
+ *        配合 GM ring buffer (RECOMPUTE_W_U_FWD_GM_RING_DEPTH) 实现 AIC/AIV 流水重叠。
  */
 
 #ifndef RECOMPUTE_W_U_FWD_CUBE_L1RESIDENT_H
 #define RECOMPUTE_W_U_FWD_CUBE_L1RESIDENT_H
 
-#include "../recompute_w_u_fwd_struct.h"
-#include "../recompute_w_u_fwd_common.h"
+#include "recompute_w_u_fwd_struct.h"
+#include "recompute_w_u_fwd_common.h"
 
 using GDN::RecomputeWUFwdTilingData;
 
@@ -65,12 +66,6 @@ public:
     using ElementW = typename BlockMmadW::ElementC;
     using LayoutW = typename BlockMmadW::LayoutC;
     static constexpr uint32_t GM_RING_DEPTH = GDN::RECOMPUTE_W_U_FWD_GM_RING_DEPTH;
-    Arch::CrossCoreFlagWithReverse<GM_RING_DEPTH> flagAivVbReady{
-        SYNC_AIC_AIV_FLAG_5, SYNC_AIV_AIC_FLAG_3};
-    Arch::CrossCoreFlagWithReverse<GM_RING_DEPTH> flagAivKbgExpReady{
-        SYNC_AIC_AIV_FLAG_6, SYNC_AIV_AIC_FLAG_4};
-    Arch::CrossCoreFlagWithReverse<GM_RING_DEPTH> flagAicRingSlotFree{
-        SYNC_AIC_AIV_RING_SLOT_FREE_FLAG, SYNC_AIV_AIC_RING_SLOT_FREE_REVERSE_FLAG};
     struct Params {
         GM_ADDR ptrA;
         LayoutA layoutA;
@@ -120,6 +115,7 @@ public:
     CATLASS_DEVICE void operator()<AscendC::AIC>(Params const &params)
     {
         Arch::Resource<ArchTag> resource;
+        uint32_t coreNumAic = AscendC::GetBlockNum();
         uint32_t coreIdx = AscendC::GetBlockIdx();
         uint32_t coreLoops = params.chunkNum;
         uint32_t bos = 0;
@@ -137,7 +133,7 @@ public:
         AscendC::GlobalTensor<ElementKbgExp> gmKbgExp;
         AscendC::GlobalTensor<ElementW> gmW;
 
-        for (uint32_t loopIdx = coreIdx; loopIdx < coreLoops; loopIdx += AscendC::GetBlockNum()) {
+        for (uint32_t loopIdx = coreIdx; loopIdx < coreLoops; loopIdx += coreNumAic) {
             GetChunkOffset(params.ptrCuSeqLens, params.ptrChunkIndices, params.B, params.Hv, params.T,
                            params.chunkSize, loopIdx, bos, eos);
             uint32_t curChunkSize = eos - bos;
@@ -152,8 +148,12 @@ public:
 
                 // === 第一部分：U = A @ Vb ===
                 // 等待 Vector 完成 Vb 计算
-                WaitVbReady();
-
+                if ((taskIdx & 0b11) == 1) {
+                    AscendC::CrossCoreWaitFlag<0x2>(SYNC_AIC_AIV_FLAG_6);
+                    if (taskIdx > 4) {
+                        AscendC::CrossCoreSetFlag<0x2, PIPE_MTE2>(SYNC_AIC_AIV_RING_SLOT_FREE_FLAG);
+                    }
+                }
                 {
                     uint32_t tileN = tla::get<1>(BdkL1TileShape{});
                     for (uint32_t nOffset = 0; nOffset < params.V; nOffset += tileN) {
@@ -179,7 +179,6 @@ public:
                 // A 矩阵 GM 地址不变，L1_RESIDENT 会跳过 A 的重新加载
                 // 等待 Vector 完成 KbgExp 计算
 
-                WaitKbgExpReady();
                 {
                     GemmCoord actualBlockShape{curChunkSize, static_cast<uint32_t>(params.K), curChunkSize};
                     gmKbgExp.SetGlobalBuffer((__gm__ ElementKbgExp *)params.ptrKbgExp +
@@ -197,10 +196,6 @@ public:
                                                  tla::MakeShape(actualBlockShape.m(), actualBlockShape.n()));
                     blockMmad(tensorBlockA, tensorBlockKbgExp, tensorBlockW, actualBlockShape);
                 }
-                // The set is issued on the same MTE2 pipe as the KbgExp GM
-                // load, so the AIV cannot reuse this slot before that load is
-                // retired.
-                Arch::CrossCoreSetFlagWithReverse<0x2, PIPE_MTE2>(flagAicRingSlotFree);
                 // Ring slots reuse the same GM address after GM_RING_DEPTH
                 // tasks.  Invalidate the resident cache before the next task
                 // so a new generation of vb/kbg_exp is copied into L1.
@@ -208,16 +203,6 @@ public:
             }
         }
         blockMmad.finalWaitFlags();
-    }
-
-    __aicore__ inline void WaitVbReady()
-    {
-        Arch::CrossCoreWaitFlagWithReverse<0x2, PIPE_FIX>(flagAivVbReady);
-    }
-
-    __aicore__ inline void WaitKbgExpReady()
-    {
-        Arch::CrossCoreWaitFlagWithReverse<0x2, PIPE_FIX>(flagAivKbgExpReady);
     }
 };
 } // namespace Catlass::Gemm::Kernel
@@ -293,7 +278,9 @@ __aicore__ void inline RecomputeWUFwdProcessL1Resident<kType, betaType, L1TileSh
     using DispatchPolicy = Gemm::MmadPingpongTlaMulti<ArchTag, true, false, 1, true>;
 #else
     using ArchTag = Arch::AtlasA2;
-    using DispatchPolicy = Gemm::MmadPingpongTlaMulti<ArchTag, true, false>;
+    // 910B 同样启用 ENABLE_L1_RESIDENT(true, 第5个模板参数) 和 L0C_STAGES=1
+    // (UnitFlag=true 时 L0C_STAGES 必须为 1, 见 block_mmad_pingpong_tla_multi.hpp static_assert)
+    using DispatchPolicy = Gemm::MmadPingpongTlaMulti<ArchTag, true, false, 1, true>;
 #endif
 
     using TileCopyU =

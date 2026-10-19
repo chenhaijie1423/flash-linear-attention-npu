@@ -85,7 +85,6 @@ struct RecomputeWUFwdTilingContext {
     uint64_t ubSize;
     size_t sysWorkspaceSize;
     uint64_t aicCoreNum;
-    bool enableA5CompactWorkspace;
 };
 
 class RecomputeWUFwdTilingProcessor {
@@ -258,6 +257,39 @@ public:
         return ge::GRAPH_SUCCESS;
     }
 
+    ge::graphStatus SetInterleavedMembaseVecRow(uint64_t ubSize, ge::DataType kType, ge::DataType betaType)
+    {
+        uint64_t sizeofKType = kType == ge::DataType::DT_FLOAT ? RECOMPUTE_W_U_FWD_SIZE_FP32 :
+                                                                 RECOMPUTE_W_U_FWD_SIZE_HALF;
+        uint64_t sizeofBetaType = betaType == ge::DataType::DT_FLOAT ? RECOMPUTE_W_U_FWD_SIZE_FP32 :
+                                                                       RECOMPUTE_W_U_FWD_SIZE_HALF;
+        OP_CHECK_IF(ubSize <= RECOMPUTE_W_U_FWD_INTERLEAVED_UB_RESERVED_BYTES,
+                    OP_LOGE(ctx_.nodeName, "UB size is too small for the interleaved membase vector path."),
+                    return ge::GRAPH_FAILED);
+
+        const uint64_t usableUbSize = ubSize - RECOMPUTE_W_U_FWD_INTERLEAVED_UB_RESERVED_BYTES;
+        const uint64_t dataDim = static_cast<uint64_t>(K > V ? K : V);
+        // Membase interleaved: dataIn/dataOut double-buffered + FP32 intermediates
+        // (dataFp32, betaFp32, betaFp32Brcb, gFp32) all allocated simultaneously.
+        const uint64_t bytesPerRow =
+            4 * dataDim * sizeofKType +              // dataInQue(2x) + dataOutQue(2x)
+            4 * sizeofBetaType +                    // betaInQue(2x) + gInQue(2x)
+            dataDim * RECOMPUTE_W_U_FWD_SIZE_FP32 + // dataFp32Buf
+            2 * RECOMPUTE_W_U_FWD_SIZE_FP32 +       // betaFp32Buf + gFp32Buf
+            RECOMPUTE_W_U_FWD_ONE_BLOCK_32;         // betaFp32BrcbBuf
+        uint64_t rowNum = static_cast<uint64_t>(chunkSize);
+        uint64_t useUbSize = rowNum * bytesPerRow;
+        while (rowNum > RECOMPUTE_W_U_FWD_INTERLEAVED_MIN_VEC_ROW && useUbSize > usableUbSize) {
+            rowNum = rowNum / 2;
+            useUbSize = rowNum * bytesPerRow;
+        }
+        OP_CHECK_IF(rowNum < RECOMPUTE_W_U_FWD_INTERLEAVED_MIN_VEC_ROW || useUbSize > usableUbSize,
+                    OP_LOGE(ctx_.nodeName, "UB size is insufficient for the interleaved membase vector path."),
+                    return ge::GRAPH_FAILED);
+        tiling_.interleavedMembaseVecRow = static_cast<int64_t>(rowNum);
+        return ge::GRAPH_SUCCESS;
+    }
+
     ge::graphStatus CommonTiling()
     {
         const gert::Shape kStorageShape = ctx_.kShape->GetStorageShape();
@@ -344,6 +376,8 @@ public:
                     OP_LOGE(ctx_.nodeName, "SetKbgExpVecRow Failed."), return ge::GRAPH_FAILED);
         OP_CHECK_IF(SetInterleavedVecRow(ctx_.ubSize, ctx_.kDtype, ctx_.betaDtype) != ge::GRAPH_SUCCESS,
                     OP_LOGE(ctx_.nodeName, "SetInterleavedVecRow Failed."), return ge::GRAPH_FAILED);
+        OP_CHECK_IF(SetInterleavedMembaseVecRow(ctx_.ubSize, ctx_.kDtype, ctx_.betaDtype) != ge::GRAPH_SUCCESS,
+                    OP_LOGE(ctx_.nodeName, "SetInterleavedMembaseVecRow Failed."), return ge::GRAPH_FAILED);
         return ge::GRAPH_SUCCESS;
     }
 
@@ -433,15 +467,10 @@ public:
     {
         uint64_t elementSize = ctx_.kDtype == ge::DataType::DT_FLOAT ? RECOMPUTE_W_U_FWD_SIZE_FP32 :
                                                                        RECOMPUTE_W_U_FWD_SIZE_HALF;
-        uint64_t userWorkspaceSize = elementSize * static_cast<uint64_t>(tiling_.B) *
-            static_cast<uint64_t>(tiling_.Hv) * static_cast<uint64_t>(tiling_.T) *
+        uint64_t userWorkspaceSize = elementSize * static_cast<uint64_t>(ctx_.aicCoreNum) *
+            static_cast<uint64_t>(RECOMPUTE_W_U_FWD_A5_GM_RING_DEPTH) *
+            static_cast<uint64_t>(tiling_.chunkSize) *
             static_cast<uint64_t>(tiling_.V + tiling_.K);
-        if (ctx_.enableA5CompactWorkspace) {
-            userWorkspaceSize = elementSize * static_cast<uint64_t>(ctx_.aicCoreNum) *
-                static_cast<uint64_t>(RECOMPUTE_W_U_FWD_A5_GM_RING_DEPTH) *
-                static_cast<uint64_t>(tiling_.chunkSize) *
-                static_cast<uint64_t>(tiling_.V + tiling_.K);
-        }
         workspaceSize_ = ctx_.sysWorkspaceSize + static_cast<size_t>(userWorkspaceSize);
         return ge::GRAPH_SUCCESS;
     }

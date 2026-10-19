@@ -491,12 +491,13 @@ recompute_w_u_fwd/
 │   └── recompute_wu_fwd_def.cpp
 ├── op_kernel/
 │   ├── arch35/
-│   │   ├── recompute_w_u_fwd_cube_l1resident.h
 │   │   └── recompute_w_u_fwd_vector_regbase.h
 │   ├── recompute_w_u_fwd.cpp
 │   ├── recompute_w_u_fwd_common.h
 │   ├── recompute_w_u_fwd_cube.h
 │   ├── recompute_w_u_fwd_struct.h
+│   ├── recompute_w_u_fwd_cube_l1resident.h
+│   ├── recompute_w_u_fwd_vector_interleaved.h
 │   └── recompute_w_u_fwd_vector.h
 └── test/
     └── test.py
